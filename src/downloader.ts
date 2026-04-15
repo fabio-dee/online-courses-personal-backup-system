@@ -5,6 +5,7 @@ import axios from 'axios';
 import { Readable } from 'stream';
 import { createConsoleLogger, type Logger } from './logger.js';
 import { COOKIES_TXT_PATH } from './auth.js';
+import { classifyVideoSource, extractMuxPlaybackId, type VideoFingerprint } from './fingerprint.js';
 
 const YTDlpWrap = (YTDlpWrapPkg as any).default || YTDlpWrapPkg;
 
@@ -98,6 +99,47 @@ export class Downloader {
         } catch (error) {
             this.logger.error(`Error downloading video: ${String(error)}`);
             throw error;
+        }
+    }
+
+    async getVideoFingerprint(url: string): Promise<VideoFingerprint | null> {
+        if (!this.ytDlp) await this.init();
+
+        const source = classifyVideoSource(url);
+        const playbackId = extractMuxPlaybackId(url);
+
+        const args = [
+            url,
+            '-j',
+            '--skip-download',
+            '--no-warnings',
+            '--no-check-certificates',
+            '--add-header', 'Referer:https://www.skool.com/',
+            '--add-header', 'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        ];
+
+        if (fs.existsSync(COOKIES_TXT_PATH)) {
+            args.push('--cookies', COOKIES_TXT_PATH);
+        }
+
+        try {
+            const stdout: string = await this.ytDlp!.execPromise(args);
+            const firstLine = stdout.split('\n').find(line => line.trim().startsWith('{'));
+            if (!firstLine) return null;
+            const meta = JSON.parse(firstLine);
+            const durationRaw = meta.duration;
+            const durationSec = typeof durationRaw === 'number' && Number.isFinite(durationRaw)
+                ? Math.round(durationRaw)
+                : undefined;
+            return {
+                source,
+                ytDlpId: typeof meta.id === 'string' ? meta.id : undefined,
+                durationSec,
+                playbackId
+            };
+        } catch (err) {
+            this.logger.warn(`    ⚠️ Could not fetch video fingerprint: ${String(err).split('\n')[0]}`);
+            return null;
         }
     }
 
