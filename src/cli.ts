@@ -11,7 +11,7 @@ import { Scraper, type CourseLibraryResult, type CourseListItem } from './scrape
 import type { Logger } from './logger.js';
 
 type CliArgs = {
-    command?: 'login' | 'download' | 'regenerate-index' | 'help';
+    command?: 'login' | 'download' | 'regenerate-index' | 'log' | 'help';
     url?: string;
     outputDir?: string;
     concurrency?: number;
@@ -19,10 +19,15 @@ type CliArgs = {
     lessonId?: string | null;
     regenerateDir?: string;
     update?: boolean;
+    logGroupDir?: string;
+    logSince?: string;
+    logLast?: number;
+    logLatest?: boolean;
+    logJson?: boolean;
 };
 
 function showHelp() {
-    console.log(`\nSkool Downloader\n\nUsage:\n  skool                          Interactive mode\n  skool login                    Log in to Skool\n  skool <classroom-url>          Download a course\n  skool <group-classroom-url>    Download all courses in a community\n  skool <lesson-url>             Download a single lesson (URL with ?md=)\n  skool regenerate-index         Regenerate all course indexes\n\nOptions:\n  -o, --output <dir>             Output directory (course root)\n  -c, --concurrency <number>     Lesson concurrency (default: 8)\n  --course                       Force course mode (ignore ?md=)\n  --lesson                       Force lesson mode\n  --lesson-id <id>               Explicit lesson id\n  --update                       Check existing lessons for updates and re-download only changed content\n  -h, --help                     Show help\n`);
+    console.log(`\nSkool Downloader\n\nUsage:\n  skool                          Interactive mode\n  skool login                    Log in to Skool\n  skool <classroom-url>          Download a course\n  skool <group-classroom-url>    Download all courses in a community\n  skool <lesson-url>             Download a single lesson (URL with ?md=)\n  skool regenerate-index         Regenerate all course indexes\n  skool log <group-dir>          Show what changed in recent runs\n    --since <Nd|Nh|Nm|ISO>       Only events newer than this\n    --last <N>                   Last N runs\n    --latest                     Latest run only (default)\n    --json                       Machine-readable output\n\nOptions:\n  -o, --output <dir>             Output directory (course root)\n  -c, --concurrency <number>     Lesson concurrency (default: 8)\n  --course                       Force course mode (ignore ?md=)\n  --lesson                       Force lesson mode\n  --lesson-id <id>               Explicit lesson id\n  --update                       Check existing lessons for updates and re-download only changed content\n  -h, --help                     Show help\n`);
 }
 
 function parseArgs(args: string[]): CliArgs {
@@ -38,6 +43,29 @@ function parseArgs(args: string[]): CliArgs {
         if (arg === 'regenerate-index') {
             parsed.command = 'regenerate-index';
             parsed.regenerateDir = args[i + 1];
+            continue;
+        }
+        if (arg === 'log') {
+            parsed.command = 'log';
+            continue;
+        }
+        if (arg === '--since') {
+            parsed.logSince = args[i + 1];
+            i++;
+            continue;
+        }
+        if (arg === '--last') {
+            const next = args[i + 1];
+            parsed.logLast = next ? Number.parseInt(next, 10) : undefined;
+            i++;
+            continue;
+        }
+        if (arg === '--latest') {
+            parsed.logLatest = true;
+            continue;
+        }
+        if (arg === '--json') {
+            parsed.logJson = true;
             continue;
         }
         if (arg === '-h' || arg === '--help') {
@@ -75,6 +103,10 @@ function parseArgs(args: string[]): CliArgs {
         if (!parsed.url && arg.startsWith('http')) {
             parsed.url = arg;
             parsed.command = 'download';
+            continue;
+        }
+        if (parsed.command === 'log' && !parsed.logGroupDir && !arg.startsWith('-')) {
+            parsed.logGroupDir = arg;
             continue;
         }
     }
@@ -517,6 +549,40 @@ async function runWithArgs(args: CliArgs) {
 
         await regenerateIndex(args.regenerateDir);
         await regenerateGroupIndex(path.dirname(args.regenerateDir));
+        return;
+    }
+
+    if (args.command === 'log') {
+        if (!args.logGroupDir) {
+            console.error('❌ Missing <group-dir> argument.\n');
+            const downloadsRoot = path.join(process.cwd(), 'downloads');
+            if (await fs.pathExists(downloadsRoot)) {
+                const entries = await fs.readdir(downloadsRoot, { withFileTypes: true });
+                const candidates = entries
+                    .filter(entry => entry.isDirectory() && !entry.name.startsWith('.'))
+                    .map(entry => path.join('downloads', entry.name));
+                if (candidates.length > 0) {
+                    console.error('Available group directories:');
+                    for (const c of candidates) console.error(`  ${c}`);
+                }
+            }
+            console.error('\nUsage: skool log <group-dir> [--since Nd|Nh|Nm|ISO] [--last N] [--latest] [--json]');
+            process.exit(1);
+            return;
+        }
+        const { queryGroupLog } = await import('./query-log.js');
+        const plainLogger: Logger = {
+            info: (m) => console.log(m),
+            warn: (m) => console.warn(m),
+            error: (m, err) => err ? console.error(m, err) : console.error(m),
+            debug: () => {}
+        };
+        await queryGroupLog(args.logGroupDir, {
+            since: args.logSince,
+            last: args.logLast,
+            latest: args.logLatest,
+            json: args.logJson
+        }, plainLogger);
         return;
     }
 
