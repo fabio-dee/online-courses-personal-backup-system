@@ -4,6 +4,14 @@ import { regenerateIndex } from './regenerate-index.js';
 import { regenerateGroupIndex } from './regenerate-group-index.js';
 import { createConsoleLogger, type Logger } from './logger.js';
 import { computeContentHash, videoFingerprintsEqual, type VideoFingerprint } from './fingerprint.js';
+import {
+    createRunStats,
+    mergeRunIntoLog,
+    printRunReport,
+    type LessonChange,
+    type LessonEventType,
+    type LessonOutcome
+} from './run-log.js';
 import fs from 'fs-extra';
 import path from 'path';
 import pLimit from 'p-limit';
@@ -71,6 +79,10 @@ type LessonManifest = {
     updatedAt: string;
     contentHash?: string;
     videoFingerprint?: VideoFingerprint;
+    firstDownloadedAt?: string;
+    lastCheckedAt?: string;
+    lastTextChangedAt?: string;
+    lastVideoChangedAt?: string;
 };
 
 export type DownloadMode = 'auto' | 'course' | 'lesson';
@@ -240,9 +252,18 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
     let completedLessons = 0;
     let failedLessons = 0;
 
+    const stats = createRunStats({
+        courseName: '',
+        groupName: '',
+        mode,
+        update: options.update === true
+    });
+
     try {
         logger.info('🚀 Fetching course structure...');
         let { modules, courseName, groupName, courseImageUrl } = await scraper.parseClassroom(classroomUrl);
+        stats.courseName = courseName;
+        stats.groupName = groupName;
 
         if (modules.length === 0) {
             throw new Error('No modules found. Are you sure this is a classroom URL and you are logged in?');
@@ -426,11 +447,20 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             }
 
                             const newContentHash = computeContentHash(lessonData);
+                            const isNewLesson = oldManifest == null;
+                            const textChanged = !isNewLesson && oldManifest?.contentHash !== newContentHash;
+
+                            stats.textsChecked += 1;
+                            if (lessonData.videoLink) {
+                                stats.videosChecked += 1;
+                            }
 
                             updateStatus('Localizing images...');
                             const localizedHtml = await downloader.localizeImages(lessonData.contentHtml || '', lessonDir);
 
                             let hasVideo = false;
+                            let videoChanged = false;
+                            let videoWasNewlyDownloaded = false;
                             let videoFingerprint: VideoFingerprint | undefined = oldManifest?.videoFingerprint;
                             if (lessonData.videoLink) {
                                 const videoPath = path.join(lessonDir, 'video.mp4');
@@ -453,6 +483,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                             await fs.remove(backupPath);
                                             hasVideo = true;
                                             videoFingerprint = newFp;
+                                            videoChanged = true;
                                         } catch (err) {
                                             logger.warn(`    ⚠️ Video re-download failed; restoring previous file`);
                                             if (fs.existsSync(backupPath)) {
@@ -476,6 +507,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                         await downloader.downloadVideo(lessonData.videoLink, lessonDir, 'video');
                                         hasVideo = true;
                                         if (!videoExistsBefore) {
+                                            videoWasNewlyDownloaded = true;
                                             const fp = await downloader.getVideoFingerprint(lessonData.videoLink);
                                             if (fp) videoFingerprint = fp;
                                         }
@@ -649,6 +681,18 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             await fs.writeFile(path.join(lessonDir, 'index.html'), htmlContent);
 
                             updateStatus('Saving metadata...');
+                            const now = new Date().toISOString();
+                            const firstDownloadedAt = oldManifest?.firstDownloadedAt ?? now;
+                            const lastCheckedAt = now;
+                            const lastTextChangedAt =
+                                isNewLesson || textChanged
+                                    ? now
+                                    : oldManifest?.lastTextChangedAt;
+                            const lastVideoChangedAt =
+                                videoChanged || videoWasNewlyDownloaded
+                                    ? now
+                                    : oldManifest?.lastVideoChangedAt;
+
                             const lessonManifest: LessonManifest = {
                                 lessonId: lesson.id,
                                 title: lesson.title,
@@ -662,12 +706,52 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                     : `${lessonDirName}/index.html`,
                                 hasVideo,
                                 resourcesCount: resourcesHtml.length,
-                                updatedAt: new Date().toISOString(),
+                                updatedAt: now,
                                 contentHash: newContentHash,
-                                videoFingerprint
+                                videoFingerprint,
+                                firstDownloadedAt,
+                                lastCheckedAt,
+                                lastTextChangedAt,
+                                lastVideoChangedAt
                             };
 
                             await writeAtomicJson(path.join(lessonDir, 'lesson.json'), lessonManifest);
+
+                            const eventTypes: LessonEventType[] = [];
+                            if (isNewLesson) eventTypes.push('lesson-added');
+                            if (textChanged) eventTypes.push('text-updated');
+                            if (videoChanged) eventTypes.push('video-updated');
+
+                            let outcome: LessonOutcome = 'unchanged';
+                            if (isNewLesson) outcome = 'new';
+                            else if (textChanged && videoChanged) outcome = 'both-updated';
+                            else if (textChanged) outcome = 'text-updated';
+                            else if (videoChanged) outcome = 'video-updated';
+
+                            if (isNewLesson) {
+                                stats.textsNew += 1;
+                                if (hasVideo) stats.videosNew += 1;
+                            }
+                            if (textChanged) stats.textsUpdated += 1;
+                            if (videoChanged) stats.videosUpdated += 1;
+
+                            const change: LessonChange = {
+                                lessonId: lesson.id,
+                                outcome,
+                                relativePath: lessonManifest.relativePath,
+                                title: lesson.title,
+                                course: courseName,
+                                moduleTitle: mInfo.title,
+                                hasVideo,
+                                events: eventTypes,
+                                timestamps: {
+                                    firstDownloadedAt,
+                                    lastCheckedAt,
+                                    lastTextChangedAt,
+                                    lastVideoChangedAt
+                                }
+                            };
+                            stats.changes.push(change);
 
                             completedLessons += 1;
                             options.callbacks?.onLessonComplete?.({
@@ -682,6 +766,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             indexLimit(() => regenerateIndex(baseOutputDir, { silent: options.suppressIndexLogs }));
                         } catch (err) {
                             failedLessons += 1;
+                            stats.failed += 1;
                             options.callbacks?.onLessonError?.({
                                 moduleIndex: mInfo.mIndex,
                                 lessonIndex: lIndex,
@@ -701,7 +786,17 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
             await runConcurrent(tasks.map(task => () => task.run()), concurrency);
         }
         await indexLimit(() => regenerateIndex(baseOutputDir, { silent: options.suppressIndexLogs }));
-        await groupIndexLimit(() => regenerateGroupIndex(activeGroupDir ?? path.dirname(baseOutputDir), { silent: options.suppressIndexLogs }));
+        const groupDir = activeGroupDir ?? path.dirname(baseOutputDir);
+        await groupIndexLimit(() => regenerateGroupIndex(groupDir, { silent: options.suppressIndexLogs }));
+
+        stats.endedAt = new Date().toISOString();
+        try {
+            await mergeRunIntoLog(groupDir, stats);
+        } catch (err) {
+            logger.warn(`⚠️ Failed to update group run log: ${String(err)}`);
+        }
+        // Re-run group index so chips/badges reflect this run's fresh timestamps.
+        await groupIndexLimit(() => regenerateGroupIndex(groupDir, { silent: options.suppressIndexLogs }));
 
         const summary: DownloadSummary = {
             courseName,
@@ -716,8 +811,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
 
         options.callbacks?.onCourseComplete?.(summary);
 
-        logger.info('\n✨ All downloads complete!');
-        logger.info(`Check your files in: ${baseOutputDir}`);
+        printRunReport(stats, logger);
 
         return summary;
     } finally {
