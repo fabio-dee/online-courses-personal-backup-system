@@ -473,7 +473,12 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                         newFp.playbackId = lessonData.muxPlaybackId;
                                     }
 
-                                    if (newFp && !videoFingerprintsEqual(newFp, oldManifest?.videoFingerprint)) {
+                                    const hasBaseline = oldManifest?.videoFingerprint != null;
+                                    if (newFp && !hasBaseline) {
+                                        logger.info(`    📝 Recording video fingerprint (first --update, trusting local file)`);
+                                        hasVideo = true;
+                                        videoFingerprint = newFp;
+                                    } else if (newFp && hasBaseline && !videoFingerprintsEqual(newFp, oldManifest!.videoFingerprint)) {
                                         logger.info(`    🔄 Video changed — re-downloading`);
                                         const backupPath = `${videoPath}.bak`;
                                         await fs.move(videoPath, backupPath, { overwrite: true });
@@ -682,7 +687,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
 
                             updateStatus('Saving metadata...');
                             const now = new Date().toISOString();
-                            const firstDownloadedAt = oldManifest?.firstDownloadedAt ?? now;
+                            const firstDownloadedAt = oldManifest?.firstDownloadedAt ?? oldManifest?.updatedAt ?? now;
                             const lastCheckedAt = now;
                             const lastTextChangedAt =
                                 isNewLesson || textChanged
