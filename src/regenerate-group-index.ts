@@ -22,7 +22,81 @@ type GroupIndexCourse = {
     modulesCount: number;
     lessonsCount: number;
     updatedAt?: string;
+    newCount: number;
+    updatedCount: number;
+    lastChangedAt?: string;
 };
+
+type GroupLogLessonEntry = {
+    relativePath?: string;
+    courseName?: string;
+    firstDownloadedAt?: string;
+    lastTextChangedAt?: string;
+    lastVideoChangedAt?: string;
+};
+
+type GroupLogShape = {
+    schemaVersion?: number;
+    runs?: Array<{ endedAt?: string }>;
+    lessons?: Record<string, GroupLogLessonEntry>;
+};
+
+async function readGroupLogRaw(groupDir: string): Promise<GroupLogShape | null> {
+    const logPath = path.join(groupDir, '.group-log.json');
+    if (!fs.existsSync(logPath)) return null;
+    try {
+        const data = await fs.readJson(logPath);
+        if (data && typeof data === 'object') return data as GroupLogShape;
+        return null;
+    } catch {
+        return null;
+    }
+}
+
+function resolveWindowStartMs(log: GroupLogShape | null): number {
+    const fallback = Date.now() - 7 * 86400000;
+    if (!log || !Array.isArray(log.runs) || log.runs.length < 2) return fallback;
+    const prev = log.runs[log.runs.length - 2];
+    const prevMs = prev?.endedAt ? Date.parse(prev.endedAt) : NaN;
+    return isNaN(prevMs) ? fallback : prevMs;
+}
+
+function latestIso(values: Array<string | undefined>): string | undefined {
+    const filtered = values.filter((v): v is string => typeof v === 'string' && v.length > 0);
+    if (filtered.length === 0) return undefined;
+    return filtered.reduce((a, b) => (a > b ? a : b));
+}
+
+function aggregateCourseFreshness(
+    log: GroupLogShape | null,
+    courseName: string,
+    windowStartMs: number
+): { newCount: number; updatedCount: number; lastChangedAt?: string } {
+    if (!log || !log.lessons) return { newCount: 0, updatedCount: 0 };
+    let newCount = 0;
+    let updatedCount = 0;
+    let lastChanged: string | undefined;
+    for (const entry of Object.values(log.lessons)) {
+        if ((entry.courseName ?? '') !== courseName) continue;
+        const firstMs = entry.firstDownloadedAt ? Date.parse(entry.firstDownloadedAt) : NaN;
+        const textMs = entry.lastTextChangedAt ? Date.parse(entry.lastTextChangedAt) : NaN;
+        const videoMs = entry.lastVideoChangedAt ? Date.parse(entry.lastVideoChangedAt) : NaN;
+        const isNew = !isNaN(firstMs) && firstMs >= windowStartMs;
+        const latest = Math.max(isNaN(textMs) ? 0 : textMs, isNaN(videoMs) ? 0 : videoMs);
+        const isUpdated = !isNew && latest >= windowStartMs;
+        if (isNew) newCount += 1;
+        if (isUpdated) updatedCount += 1;
+        const entryLatest = latestIso([
+            entry.firstDownloadedAt,
+            entry.lastTextChangedAt,
+            entry.lastVideoChangedAt
+        ]);
+        if (entryLatest && (!lastChanged || entryLatest > lastChanged)) {
+            lastChanged = entryLatest;
+        }
+    }
+    return { newCount, updatedCount, lastChangedAt: lastChanged };
+}
 
 type RegenerateOptions = {
     silent?: boolean;
@@ -84,7 +158,12 @@ async function countLessons(coursePath: string) {
     return { modulesCount, lessonsCount };
 }
 
-async function loadCourseInfo(coursePath: string, dirName: string): Promise<GroupIndexCourse | null> {
+async function loadCourseInfo(
+    coursePath: string,
+    dirName: string,
+    log: GroupLogShape | null,
+    windowStartMs: number
+): Promise<GroupIndexCourse | null> {
     const manifestPath = path.join(coursePath, '.course.json');
     let manifest: CourseManifest | null = null;
     if (await fs.pathExists(manifestPath)) {
@@ -99,6 +178,7 @@ async function loadCourseInfo(coursePath: string, dirName: string): Promise<Grou
     const groupName = manifest?.groupName;
     const courseImagePath = manifest?.courseImagePath;
     const counts = await countLessons(coursePath);
+    const freshness = aggregateCourseFreshness(log, courseName, windowStartMs);
 
     return {
         dirName,
@@ -107,7 +187,10 @@ async function loadCourseInfo(coursePath: string, dirName: string): Promise<Grou
         courseImagePath,
         modulesCount: counts.modulesCount,
         lessonsCount: counts.lessonsCount,
-        updatedAt: manifest?.updatedAt
+        updatedAt: manifest?.updatedAt,
+        newCount: freshness.newCount,
+        updatedCount: freshness.updatedCount,
+        lastChangedAt: freshness.lastChangedAt
     };
 }
 
@@ -126,12 +209,15 @@ async function regenerateGroupIndex(
     const entries = await fs.readdir(groupDir, { withFileTypes: true });
     const courseDirs = entries.filter(entry => entry.isDirectory() && !entry.name.startsWith('.'));
 
+    const groupLog = await readGroupLogRaw(groupDir);
+    const windowStartMs = resolveWindowStartMs(groupLog);
+
     const courses: GroupIndexCourse[] = [];
     let resolvedGroupName: string | null = null;
 
     for (const courseDir of courseDirs) {
         const coursePath = path.join(groupDir, courseDir.name);
-        const courseInfo = await loadCourseInfo(coursePath, courseDir.name);
+        const courseInfo = await loadCourseInfo(coursePath, courseDir.name, groupLog, windowStartMs);
         if (!courseInfo) continue;
 
         courses.push(courseInfo);
@@ -174,11 +260,22 @@ async function regenerateGroupIndex(
                 ? new Date(course.updatedAt).toLocaleDateString()
                 : 'Unknown';
 
+            const chips: string[] = [];
+            if (course.newCount > 0) {
+                chips.push(`<span class="freshness-chip freshness-chip-new">+${course.newCount} new</span>`);
+            }
+            if (course.updatedCount > 0) {
+                chips.push(`<span class="freshness-chip freshness-chip-updated">${course.updatedCount} updated</span>`);
+            }
+            const chipHtml = chips.length > 0 ? `<div class="freshness-chips">${chips.join('')}</div>` : '';
+            const courseLastChanged = course.lastChangedAt ?? '';
+
             return `
-                <a class="course-card" href="${courseIndexPath}">
+                <a class="course-card" href="${courseIndexPath}" data-course-last-changed-at="${courseLastChanged}">
                     <div class="course-image">${imageMarkup}</div>
                     <div class="course-body">
                         <h2>${course.courseName}</h2>
+                        ${chipHtml}
                         <p class="course-meta">Updated ${updatedLabel}</p>
                         <div class="course-stats">
                             <span><strong>${course.modulesCount}</strong> modules</span>
@@ -321,6 +418,33 @@ async function regenerateGroupIndex(
                     font-size: 0.95rem;
                 }
                 .course-stats strong { color: var(--accent-2); }
+                .freshness-chips {
+                    display: flex;
+                    flex-wrap: wrap;
+                    gap: 6px;
+                }
+                .freshness-chip {
+                    font-size: 0.72rem;
+                    padding: 3px 10px;
+                    border-radius: 999px;
+                    font-weight: 700;
+                    letter-spacing: 0.04em;
+                    display: inline-block;
+                }
+                .freshness-chip-new     { background: #dcfce7; color: #14532d; }
+                .freshness-chip-updated { background: #fef3c7; color: #78350f; }
+                .filter-bar {
+                    margin: 24px 0 0 0;
+                    display: flex;
+                    align-items: center;
+                    gap: 12px;
+                }
+                .filter-bar select {
+                    padding: 6px 10px;
+                    border-radius: 8px;
+                    border: 1px solid rgba(20,22,29,0.12);
+                    background: white;
+                }
             </style>
         </head>
         <body>
@@ -334,10 +458,45 @@ async function regenerateGroupIndex(
                         <div class="chip">Updated: <strong>${new Date().toLocaleDateString()}</strong></div>
                     </div>
                 </section>
+                <div class="filter-bar">
+                    <label for="freshness-filter">Show:</label>
+                    <select id="freshness-filter">
+                        <option value="all">All</option>
+                        <option value="24h">Last 24h</option>
+                        <option value="7d">Last 7 days</option>
+                        <option value="30d">Last 30 days</option>
+                    </select>
+                </div>
                 <section class="courses">
                     ${courseCards.join('')}
                 </section>
             </div>
+            <script>
+            (function() {
+                var select = document.getElementById('freshness-filter');
+                if (!select) return;
+                var KEY = 'skool-group-freshness-filter';
+                var saved = localStorage.getItem(KEY);
+                if (saved) select.value = saved;
+                function apply() {
+                    var v = select.value;
+                    localStorage.setItem(KEY, v);
+                    var cutoff = null;
+                    if (v === '24h') cutoff = Date.now() - 86400000;
+                    else if (v === '7d') cutoff = Date.now() - 7*86400000;
+                    else if (v === '30d') cutoff = Date.now() - 30*86400000;
+                    var nodes = document.querySelectorAll('[data-course-last-changed-at]');
+                    for (var i = 0; i < nodes.length; i++) {
+                        var el = nodes[i];
+                        if (cutoff == null) { el.style.display = ''; continue; }
+                        var ts = Date.parse(el.getAttribute('data-course-last-changed-at') || '');
+                        el.style.display = (!isNaN(ts) && ts >= cutoff) ? '' : 'none';
+                    }
+                }
+                select.addEventListener('change', apply);
+                apply();
+            })();
+            </script>
         </body>
         </html>
     `;

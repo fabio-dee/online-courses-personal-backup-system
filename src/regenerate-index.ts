@@ -26,7 +26,57 @@ type LessonManifest = {
     hasVideo: boolean;
     resourcesCount: number;
     updatedAt: string;
+    firstDownloadedAt?: string;
+    lastCheckedAt?: string;
+    lastTextChangedAt?: string;
+    lastVideoChangedAt?: string;
 };
+
+type BadgeKind = 'new' | 'updated' | null;
+
+function lessonLastChangedAt(info: {
+    firstDownloadedAt?: string;
+    lastTextChangedAt?: string;
+    lastVideoChangedAt?: string;
+    updatedAt?: string;
+}): string | undefined {
+    const candidates = [info.lastTextChangedAt, info.lastVideoChangedAt, info.firstDownloadedAt, info.updatedAt]
+        .filter((v): v is string => typeof v === 'string' && v.length > 0);
+    if (candidates.length === 0) return undefined;
+    return candidates.reduce((a, b) => (a > b ? a : b));
+}
+
+function computeBadge(
+    info: { firstDownloadedAt?: string; lastTextChangedAt?: string; lastVideoChangedAt?: string },
+    windowStartMs: number
+): BadgeKind {
+    const firstMs = info.firstDownloadedAt ? Date.parse(info.firstDownloadedAt) : NaN;
+    if (!isNaN(firstMs) && firstMs >= windowStartMs) return 'new';
+    const textMs = info.lastTextChangedAt ? Date.parse(info.lastTextChangedAt) : NaN;
+    const videoMs = info.lastVideoChangedAt ? Date.parse(info.lastVideoChangedAt) : NaN;
+    const latest = Math.max(isNaN(textMs) ? 0 : textMs, isNaN(videoMs) ? 0 : videoMs);
+    if (latest >= windowStartMs) return 'updated';
+    return null;
+}
+
+async function resolveWindowStartMs(downloadsDir: string): Promise<number> {
+    const groupDir = path.dirname(downloadsDir);
+    const logPath = path.join(groupDir, '.group-log.json');
+    const fallback = Date.now() - 7 * 86400000;
+    if (!fs.existsSync(logPath)) return fallback;
+    try {
+        const data = await fs.readJson(logPath);
+        const runs = Array.isArray(data?.runs) ? data.runs : [];
+        if (runs.length >= 2) {
+            const prev = runs[runs.length - 2];
+            const prevMs = prev?.endedAt ? Date.parse(prev.endedAt) : NaN;
+            if (!isNaN(prevMs)) return prevMs;
+        }
+    } catch {
+        // ignore
+    }
+    return fallback;
+}
 
 async function writeAtomicHtml(filePath: string, content: string) {
     const tempPath = `${filePath}.tmp`;
@@ -55,6 +105,8 @@ async function regenerateIndex(
     }
 
     log(`🔍 Scanning downloads directory: ${downloadsDir}`);
+
+    const windowStartMs = await resolveWindowStartMs(downloadsDir);
 
     let courseManifest: CourseManifest | null = null;
     const courseManifestPath = path.join(downloadsDir, '.course.json');
@@ -125,6 +177,10 @@ async function regenerateIndex(
                 let lessonIndex = parseInt(lessonDir.name.split('-')[0]) || 999;
                 let moduleTitleOverride: string | null = null;
                 let moduleIndexOverride: number | null = null;
+                let firstDownloadedAt: string | undefined;
+                let lastTextChangedAt: string | undefined;
+                let lastVideoChangedAt: string | undefined;
+                let updatedAt: string | undefined;
 
                 if (fs.existsSync(manifestPath)) {
                     try {
@@ -134,6 +190,10 @@ async function regenerateIndex(
                         lessonIndex = manifest.lessonIndex ?? lessonIndex;
                         moduleTitleOverride = manifest.moduleTitle || null;
                         moduleIndexOverride = manifest.moduleIndex ?? null;
+                        firstDownloadedAt = manifest.firstDownloadedAt;
+                        lastTextChangedAt = manifest.lastTextChangedAt;
+                        lastVideoChangedAt = manifest.lastVideoChangedAt;
+                        updatedAt = manifest.updatedAt;
                     } catch (err) {
                         warn(`⚠️ Failed to read manifest for ${lessonDir.name}, using directory data.`);
                     }
@@ -144,7 +204,11 @@ async function regenerateIndex(
                     path: relativePath,
                     index: lessonIndex,
                     moduleTitleOverride,
-                    moduleIndexOverride
+                    moduleIndexOverride,
+                    firstDownloadedAt,
+                    lastTextChangedAt,
+                    lastVideoChangedAt,
+                    updatedAt
                 });
             }
         }
@@ -182,6 +246,10 @@ async function regenerateIndex(
                 let lessonIndex = parseInt(lessonDir.name.split('-')[0]) || 999;
                 let moduleTitleOverride: string | null = null;
                 let moduleIndexOverride: number | null = null;
+                let firstDownloadedAt: string | undefined;
+                let lastTextChangedAt: string | undefined;
+                let lastVideoChangedAt: string | undefined;
+                let updatedAt: string | undefined;
 
                 if (fs.existsSync(manifestPath)) {
                     try {
@@ -191,6 +259,10 @@ async function regenerateIndex(
                         lessonIndex = manifest.lessonIndex ?? lessonIndex;
                         moduleTitleOverride = manifest.moduleTitle || null;
                         moduleIndexOverride = manifest.moduleIndex ?? null;
+                        firstDownloadedAt = manifest.firstDownloadedAt;
+                        lastTextChangedAt = manifest.lastTextChangedAt;
+                        lastVideoChangedAt = manifest.lastVideoChangedAt;
+                        updatedAt = manifest.updatedAt;
                     } catch (err) {
                         warn(`⚠️ Failed to read manifest for ${lessonDir.name}, using directory data.`);
                     }
@@ -201,7 +273,11 @@ async function regenerateIndex(
                     path: relativePath,
                     index: lessonIndex,
                     moduleTitleOverride,
-                    moduleIndexOverride
+                    moduleIndexOverride,
+                    firstDownloadedAt,
+                    lastTextChangedAt,
+                    lastVideoChangedAt,
+                    updatedAt
                 });
             }
         }
@@ -410,6 +486,30 @@ async function regenerateIndex(
                         border-color: rgba(59,130,246,0.6);
                         transform: translateY(-2px);
                     }
+                    .badge {
+                        font-size: 0.7rem;
+                        padding: 2px 8px;
+                        border-radius: 999px;
+                        font-weight: 700;
+                        letter-spacing: 0.04em;
+                        margin-left: 8px;
+                        vertical-align: middle;
+                        display: inline-block;
+                    }
+                    .badge-new     { background: #dcfce7; color: #14532d; }
+                    .badge-updated { background: #fef3c7; color: #78350f; }
+                    .filter-bar {
+                        margin: 0 0 18px 0;
+                        display: flex;
+                        align-items: center;
+                        gap: 12px;
+                    }
+                    .filter-bar select {
+                        padding: 6px 10px;
+                        border-radius: 8px;
+                        border: 1px solid rgba(20,22,29,0.12);
+                        background: white;
+                    }
                     @media (min-width: 900px) {
                         .hero { grid-template-columns: 1.15fr 0.85fr; }
                     }
@@ -444,17 +544,70 @@ async function regenerateIndex(
                         </div>
                     </section>
 
+                    <div class="filter-bar">
+                        <label for="freshness-filter">Show:</label>
+                        <select id="freshness-filter">
+                            <option value="all">All</option>
+                            <option value="24h">Last 24h</option>
+                            <option value="7d">Last 7 days</option>
+                            <option value="30d">Last 30 days</option>
+                        </select>
+                    </div>
+
                     <section class="content">
                         ${courseInfo.map(m => `
                             <div class="module">
                                 <h2 class="module-title"><span>Module ${m.index}</span>${m.title}</h2>
                                 <ul class="lesson-list">
-                                    ${m.lessons.map((l: any) => `<li class="lesson"><a href="${l.path}">${l.title}</a></li>`).join('')}
+                                    ${m.lessons.map((l: any) => {
+                                        const badge = computeBadge({
+                                            firstDownloadedAt: l.firstDownloadedAt,
+                                            lastTextChangedAt: l.lastTextChangedAt,
+                                            lastVideoChangedAt: l.lastVideoChangedAt
+                                        }, windowStartMs);
+                                        const badgeHtml = badge
+                                            ? ` <span class="badge badge-${badge}">${badge.toUpperCase()}</span>`
+                                            : '';
+                                        const status = badge ?? 'unchanged';
+                                        const lastChanged = lessonLastChangedAt({
+                                            firstDownloadedAt: l.firstDownloadedAt,
+                                            lastTextChangedAt: l.lastTextChangedAt,
+                                            lastVideoChangedAt: l.lastVideoChangedAt,
+                                            updatedAt: l.updatedAt
+                                        }) ?? '';
+                                        return `<li class="lesson" data-status="${status}" data-last-changed-at="${lastChanged}"><a href="${l.path}">${l.title}${badgeHtml}</a></li>`;
+                                    }).join('')}
                                 </ul>
                             </div>
                         `).join('')}
                     </section>
                 </div>
+                <script>
+                (function() {
+                    var select = document.getElementById('freshness-filter');
+                    if (!select) return;
+                    var KEY = 'skool-freshness-filter';
+                    var saved = localStorage.getItem(KEY);
+                    if (saved) select.value = saved;
+                    function apply() {
+                        var v = select.value;
+                        localStorage.setItem(KEY, v);
+                        var cutoff = null;
+                        if (v === '24h') cutoff = Date.now() - 86400000;
+                        else if (v === '7d') cutoff = Date.now() - 7*86400000;
+                        else if (v === '30d') cutoff = Date.now() - 30*86400000;
+                        var nodes = document.querySelectorAll('[data-last-changed-at]');
+                        for (var i = 0; i < nodes.length; i++) {
+                            var el = nodes[i];
+                            if (cutoff == null) { el.style.display = ''; continue; }
+                            var ts = Date.parse(el.getAttribute('data-last-changed-at') || '');
+                            el.style.display = (!isNaN(ts) && ts >= cutoff) ? '' : 'none';
+                        }
+                    }
+                    select.addEventListener('change', apply);
+                    apply();
+                })();
+                </script>
             </body>
             </html>
         `;
