@@ -9,3 +9,6 @@ bin/ffprobe*
 .env
 .env.*
 .envrc
+.DS_Store
+.claude/
+dist/
