@@ -1,6 +1,6 @@
 # Fork notes
 
-This is a personal fork of [balmasi/skool-downloader](https://github.com/balmasi/skool-downloader) that ships additional branches with proposed upstream contributions and working features. The repo is renamed (`online-courses-personal-backup-system`) to avoid advertising itself as a Skool-specific downloader in search results.
+This repository originated as a personal fork of [balmasi/skool-downloader](https://github.com/balmasi/skool-downloader) and is now maintained as an **independent downstream project**. Upstream is a read-only reference — useful fixes are cherry-picked when wanted, but this fork's `main` does not track upstream linearly anymore. The repo is renamed (`online-courses-personal-backup-system`) to avoid advertising itself as a Skool-specific downloader in search results.
 
 ## Branches
 
@@ -25,15 +25,17 @@ This is a personal fork of [balmasi/skool-downloader](https://github.com/balmasi
 
 Python pipeline for turning a Skool scrape into an Obsidian-ready vault (Haiku tagging, wikilinks, Maps of Content) lives at **[fabio-dee/course-to-obsidian](https://github.com/fabio-dee/course-to-obsidian)**. It's a downstream adapter, not an upstream contribution. The `scripts/` directory on some branches of this fork still contains the Python files for convenience; the authoritative versions live in `course-to-obsidian`.
 
-## Sync with upstream
+## Trunk & integration
 
-Upstream baseline (`main`) is synced periodically via:
+`main` on `origin-public` is the authoritative trunk and already contains the integrated work from PRs #5, #6, and `feat/run-log-report`, plus downstream-only features (pinned-post fallback, rescrape helper). New features are developed on `feat/*` branches off `main` and merged back via `git merge --no-ff`. The private remote (`origin-private`) is a passive mirror of public — kept in sync via the `git pushboth` alias.
+
+The frozen PR branches (`pr/reliability-fixes`, `pr/update-detection`, `fix/download-reliability`, `feat/run-log-report`) are left intact. They still back the open upstream PRs. They are never force-pushed or re-committed onto — if upstream ever merges one, the content already lives on `main` and no action is needed here.
+
+## Cherry-picking upstream fixes
 
 ```bash
 git fetch upstream
-git checkout main
-git merge --ff-only upstream/main
-git push origin-public main
+git log upstream/main --oneline --not main   # what's new upstream
+git cherry-pick <sha>
+git pushboth main
 ```
-
-All feature branches are stacked atop `upstream/main` (not `main` of this fork) so upstream merges are clean cherry-pick / rebase candidates.

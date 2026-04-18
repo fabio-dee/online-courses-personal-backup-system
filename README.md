@@ -1,8 +1,23 @@
 # 🎓 Skool Downloader
 
-A robust, platform-independent CLI tool to create local, offline backups of your [Skool.com](https://skool.com) courses. 
+A robust, platform-independent CLI tool to create local, offline backups of your [Skool.com](https://skool.com) courses.
 
 This tool downloads video content, localizes images, preserves course attachments, and generates a navigable, styled HTML structure that mirrors the online classroom.
+
+## About this fork
+
+This repository started as a fork of [balmasi/skool-downloader](https://github.com/balmasi/skool-downloader) — full credit to the original author for the core architecture and Playwright-based scraping approach.
+
+It is now maintained as an **independent downstream project**. Several improvements that were originally proposed as upstream PRs (reliability fixes, update detection, run-log reporting, and the pinned-post fallback) are already integrated on `main` here and will continue to evolve, regardless of whether they land upstream. The upstream PRs are left open as a courtesy — if the original maintainer wants to adopt any of them, they're there.
+
+What's different here:
+- **Pinned-post fallback** — follows the linked community post when a classroom lesson is just a post-card with no inline body/video, and extracts the body, video, and attachments from the post.
+- **Update detection** — content and video fingerprints on every lesson so subsequent runs skip unchanged work and flag genuinely modified lessons.
+- **Reliability fixes** — platform-specific yt-dlp binaries, tuned fragment concurrency, better handling of member-only courses.
+- **Run-log reporting** — structured per-run logs with a `skool log` subcommand, and NEW/UPDATED badges in the generated index.
+- **`rescrape-empty-lessons.ts`** helper — scans a downloaded course tree for silently-empty lessons and wipes their manifests so the next run re-scrapes them with the fallback.
+
+Upstream bug fixes are cherry-picked as needed; this fork does **not** track upstream `main` linearly.
 
 ## ✨ Features
 
