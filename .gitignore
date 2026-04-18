@@ -6,4 +6,9 @@ node_modules/*
 bin/yt-dlp*
 bin/ffmpeg*
 bin/ffprobe*
+.env
+.env.*
+.envrc
 .DS_Store
+.claude/
+dist/
