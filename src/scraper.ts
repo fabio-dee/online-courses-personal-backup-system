@@ -504,8 +504,6 @@ export class Scraper {
             }
         }
 
-        await page.close();
-
         // Skool stores rich text as a stringified JSON array or primitive HTML
         let body = metadata.desc || foundLesson?.body || '';
 
@@ -519,6 +517,131 @@ export class Scraper {
                 this.logger.error(`Failed to parse TipTap content: ${String(e)}`);
             }
         }
+
+        // Treat body as "effectively empty" when it has no visible text content
+        // (e.g. "<p></p>" from an empty [v2] TipTap payload).
+        const bodyTextOnly = typeof body === 'string'
+            ? body.replace(/<[^>]+>/g, '').replace(/&nbsp;/g, ' ').trim()
+            : '';
+
+        // Pinned-post fallback: some "lessons" are just a link card to a community post.
+        // When the lesson has no body and no video, follow the pinned post link and
+        // pull body/video/attachments from pageProps.postTree.post on the post page.
+        if (!bodyTextOnly && !vLink) {
+            try {
+                const postHref = await page.evaluate(() => {
+                    const wrapper = document.querySelector('div[class*="PinnedPostsWrapper"]');
+                    if (!wrapper) return null;
+                    // The title link wraps a div[class*="Title"]; prefer that shape.
+                    const titleDiv = wrapper.querySelector('div[class*="TitleWrapper"], div[class*="Title-sc"]');
+                    let a: HTMLAnchorElement | null = titleDiv ? titleDiv.closest('a') as HTMLAnchorElement | null : null;
+                    if (!a) {
+                        // Fallback: scan anchors, pick the one that looks like /<community>/<post-slug>
+                        // (skip author links /@…, category links with ?c=, and single-segment links).
+                        const anchors = Array.from(wrapper.querySelectorAll('a[href]')) as HTMLAnchorElement[];
+                        a = anchors.find(el => {
+                            const href = el.getAttribute('href') || '';
+                            if (!href.startsWith('/')) return false;
+                            if (href.startsWith('/@')) return false;
+                            if (href.includes('?c=')) return false;
+                            const pathOnly = href.split('?')[0];
+                            const segs = pathOnly.split('/').filter(Boolean);
+                            return segs.length >= 2;
+                        }) || null;
+                    }
+                    return a ? a.getAttribute('href') : null;
+                });
+
+                if (postHref) {
+                    const postUrl = new URL(postHref, 'https://www.skool.com').toString();
+                    this.logger.info(`    🔗 Lesson has no body/video; following pinned post → ${postUrl}`);
+                    await page.goto(postUrl, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                    await page.waitForTimeout(2000);
+
+                    const postNext = await page.evaluate(() => {
+                        const s = document.getElementById('__NEXT_DATA__');
+                        return s ? JSON.parse(s.innerText) : null;
+                    });
+                    const postRoot = postNext?.props?.pageProps?.postTree?.post;
+                    const pm = postRoot?.metadata || {};
+
+                    if (pm.content || pm.videoLinks) {
+                        body = this.postContentToHtml(pm.content || '', pm.title);
+                        if (!vLink && typeof pm.videoLinks === 'string' && pm.videoLinks.trim()) {
+                            vLink = pm.videoLinks.split(',')[0].trim();
+                        }
+
+                        // Merge post attachments into the lesson's resources
+                        const newResources: Resource[] = [];
+                        try {
+                            if (pm.attachmentsData) {
+                                const atts = JSON.parse(pm.attachmentsData);
+                                if (Array.isArray(atts)) {
+                                    for (const a of atts) {
+                                        const meta = a?.metadata || {};
+                                        const fileName = meta.file_name || a?.id;
+                                        const direct = meta.read_url || meta.src_read_url;
+                                        if (!fileName) continue;
+                                        if (direct) {
+                                            newResources.push({
+                                                title: fileName,
+                                                file_name: fileName,
+                                                file_content_type: meta.content_type,
+                                                downloadUrl: direct,
+                                                isExternal: true
+                                            });
+                                        } else if (a?.id) {
+                                            newResources.push({
+                                                title: fileName,
+                                                file_name: fileName,
+                                                file_content_type: meta.content_type,
+                                                file_id: a.id
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (e) {
+                            this.logger.warn(`    ⚠️ Failed to parse post attachments: ${String(e)}`);
+                        }
+
+                        // Resolve download URLs for native post attachments that don't have a direct read_url
+                        for (const res of newResources) {
+                            if (res.isExternal || (res.downloadUrl && res.downloadUrl.startsWith('http')) || !res.file_id) continue;
+                            try {
+                                const response = await page.evaluate(async (fileId: string) => {
+                                    const apiUrl = `https://api2.skool.com/files/${fileId}/download-url?expire=28800`;
+                                    const resp = await fetch(apiUrl, { method: 'POST', credentials: 'include' });
+                                    if (!resp.ok) return { success: false, error: `HTTP ${resp.status}` };
+                                    const text = await resp.text();
+                                    return { success: true, url: text.trim() };
+                                }, res.file_id);
+                                if (response.success && response.url) res.downloadUrl = response.url;
+                            } catch {
+                                // non-fatal
+                            }
+                        }
+
+                        // Merge (dedupe by title) into existing resources
+                        for (const nr of newResources) {
+                            if (!resources.some(r => r.title === nr.title)) resources.push(nr);
+                        }
+
+                        this.logger.info(
+                            `    ✅ Pinned-post fallback populated body` +
+                            `${vLink ? ' + video' : ''}` +
+                            `${newResources.length ? ` + ${newResources.length} attachment(s)` : ''}`
+                        );
+                    } else {
+                        this.logger.warn(`    ⚠️ Pinned-post page had no content/video in __NEXT_DATA__`);
+                    }
+                }
+            } catch (err) {
+                this.logger.warn(`    ⚠️ Pinned-post fallback failed: ${String(err)}`);
+            }
+        }
+
+        await page.close();
 
         let muxPlaybackId: string | undefined;
         if (vLink && /stream\.video\.skool\.com|mux\.com/.test(vLink)) {
@@ -543,6 +666,26 @@ export class Scraper {
 
     // Helper removed as logic is now in extractLessonData for shared state
 
+
+    private postContentToHtml(raw: string, title?: string): string {
+        if (!raw && !title) return '';
+        // Strip Skool user mentions: [@Name](obj://user/ID) → @Name
+        let s = (raw || '').replace(/\[@([^\]]+)\]\(obj:\/\/user\/[^)]+\)/g, '@$1');
+        // Escape HTML
+        s = s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        // Convert markdown links [text](http…|mailto:…)
+        s = s.replace(/\[([^\]]+)\]\(((?:https?:|mailto:)[^)]+)\)/g,
+            '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+        const paragraphs = s
+            .split(/\n{2,}/)
+            .filter(p => p.trim().length > 0)
+            .map(p => `<p>${p.replace(/\n/g, '<br/>')}</p>`)
+            .join('');
+        const safeTitle = title ? title.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : '';
+        const header = safeTitle ? `<h2>${safeTitle}</h2>` : '';
+        const note = `<p><em>📌 Content mirrored from linked community post.</em></p>`;
+        return `${header}${note}${paragraphs}`;
+    }
 
     private parseTipTap(nodes: any[]): string {
         return nodes.map(node => {
