@@ -464,7 +464,11 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             let videoFingerprint: VideoFingerprint | undefined = oldManifest?.videoFingerprint;
                             if (lessonData.videoLink) {
                                 const videoPath = path.join(lessonDir, 'video.mp4');
-                                const videoExistsBefore = fs.existsSync(videoPath) && fs.statSync(videoPath).size > 0;
+                                const hevcPath = path.join(lessonDir, 'video.hevc.mp4');
+                                // Accept either the original download OR the post-encoded HEVC variant as "present".
+                                const videoExistsBefore = [videoPath, hevcPath].some(
+                                    (p) => fs.existsSync(p) && fs.statSync(p).size > 0,
+                                );
 
                                 if (options.update && videoExistsBefore) {
                                     updateStatus('Checking video freshness...');

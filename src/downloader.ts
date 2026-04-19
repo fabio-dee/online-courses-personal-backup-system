@@ -64,14 +64,19 @@ export class Downloader {
 
         await fs.ensureDir(outputDir);
         const outputPath = path.join(outputDir, `${filename}.mp4`);
+        const hevcPath = path.join(outputDir, `${filename}.hevc.mp4`);
 
-        // Skip if video already exists
-        if (fs.existsSync(outputPath)) {
-            const stats = fs.statSync(outputPath);
-            if (stats.size > 0) {
-                this.logger.info(`    ⏭️  Video already exists, skipping download (${(stats.size / 1024 / 1024).toFixed(2)} MB)`);
-                return;
-            }
+        // Skip if the original (.mp4) OR a post-processed variant (.hevc.mp4) already exists.
+        // The HEVC variant is produced by the sibling `course-to-obsidian` re-encoder,
+        // which may delete the original after converting. Treat either as "downloaded".
+        const existingVideo = [outputPath, hevcPath].find(
+            (p) => fs.existsSync(p) && fs.statSync(p).size > 0,
+        );
+        if (existingVideo) {
+            const stats = fs.statSync(existingVideo);
+            const name = path.basename(existingVideo);
+            this.logger.info(`    ⏭️  Video already exists (${name}, ${(stats.size / 1024 / 1024).toFixed(2)} MB), skipping download`);
+            return;
         }
 
         const displayUrl = url.length > 100 ? url.substring(0, 97) + '...' : url;

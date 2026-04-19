@@ -212,8 +212,11 @@ function createTaskRunner() {
         );
 
         await list.run();
-        if (typeof list.renderer?.end === 'function') {
-            list.renderer.end();
+        // Accessing Listr's private `renderer` to flush output before we continue.
+        // Typed as `any` intentionally — Listr exposes no public API for this.
+        const listAny = list as any;
+        if (typeof listAny.renderer?.end === 'function') {
+            listAny.renderer.end();
         }
         process.stdout.write('\n');
         await new Promise(resolve => setTimeout(resolve, 0));
