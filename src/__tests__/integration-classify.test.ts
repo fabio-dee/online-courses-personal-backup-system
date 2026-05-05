@@ -197,8 +197,10 @@ describe('classification: body change detection', () => {
         expect(result).toBe('MINOR');
     });
 
-    it('scoreBody returns MINOR when prior hash is null', () => {
-        const result = scoreBody(null, 'hash-new');
-        expect(result).toBe('MINOR');
+    it('scoreBody returns UNCHANGED when prior hash is null (P0-1: null means unavailable, not changed)', () => {
+        // null on either side means the HTML was unavailable during offline rebuild;
+        // treat as UNCHANGED to avoid false-positive body change detection.
+        expect(scoreBody(null, 'hash-new')).toBe('UNCHANGED');
+        expect(scoreBody('hash-old', null)).toBe('UNCHANGED');
     });
 });

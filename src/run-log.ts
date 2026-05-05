@@ -245,6 +245,48 @@ export async function mergeRunIntoLog(groupDir: string, stats: RunStats): Promis
     await writeAtomicJson(groupLogPath(groupDir), log);
 }
 
+/**
+ * Idempotently stamp fp_schema=2 onto the group log and append a synthetic
+ * refingerprint run entry so future --update runs see a current fp_schema.
+ * Called by runRefingerprint after scanning all lessons (P0-5 fix).
+ */
+export async function stampFpSchema(groupDir: string): Promise<void> {
+    await fs.ensureDir(groupDir);
+    const existing = await readGroupLog(groupDir);
+    const log: GroupLog = existing ?? {
+        schemaVersion: 1,
+        fp_schema: 2,
+        groupName: path.basename(groupDir),
+        lessons: {},
+        events: [],
+        runs: []
+    };
+    log.fp_schema = 2;
+
+    const now = new Date().toISOString();
+    const runSummary: RunSummary = {
+        runId: newRunId(),
+        startedAt: now,
+        endedAt: now,
+        courseName: '',
+        mode: 'refingerprint',
+        update: false,
+        videosChecked: 0,
+        videosNew: 0,
+        videosUpdated: 0,
+        textsChecked: 0,
+        textsNew: 0,
+        textsUpdated: 0,
+        failed: 0
+    };
+    log.runs.push(runSummary);
+    if (log.runs.length > RUN_CAP) {
+        log.runs = log.runs.slice(log.runs.length - RUN_CAP);
+    }
+
+    await writeAtomicJson(groupLogPath(groupDir), log);
+}
+
 function formatList(changes: LessonChange[], predicate: (c: LessonChange) => boolean): string[] {
     return changes.filter(predicate).map(c => c.relativePath);
 }

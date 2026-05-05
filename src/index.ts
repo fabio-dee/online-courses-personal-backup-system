@@ -16,6 +16,7 @@ import type { PerceptualFingerprint } from './fingerprint/perceptual/types.js';
 import {
     createRunStats,
     mergeRunIntoLog,
+    stampFpSchema,
     printRunReport,
     type LessonChange,
     type LessonEventType,
@@ -24,6 +25,19 @@ import {
 import fs from 'fs-extra';
 import path from 'path';
 import pLimit from 'p-limit';
+
+/**
+ * Thrown by the sanity-check when >30% of lessons have no prior manifest.
+ * Caught by the CLI entry point AFTER scraper.close() runs via the finally block,
+ * so Playwright is never leaked (P0-4 fix — replaces process.exit(2) inside try).
+ */
+export class SanityCheckAbort extends Error {
+    readonly exitCode = 2;
+    constructor(message: string) {
+        super(message);
+        this.name = 'SanityCheckAbort';
+    }
+}
 
 const DEFAULT_CONCURRENCY = 8;
 const MAX_CONCURRENCY = 16;
@@ -235,10 +249,18 @@ async function loadOrRebuildFingerprint(
         return { fp: null, wasStale: true };
     }
 
+    // Read the saved HTML from disk so bodyHash is computed from actual content,
+    // not from manifest.contentHash which is already a sha256 hex string (wrong input).
+    // If index.html is absent, pass null and bodyHash will be null in the fp.
+    const indexHtmlPath = path.join(lessonDir, 'index.html');
+    const bodyHtml: string | null = fs.existsSync(indexHtmlPath)
+        ? await fs.readFile(indexHtmlPath, 'utf8').catch(() => null)
+        : null;
+
     try {
         const fp = await computeFullFingerprint(
             existingVideoPath,
-            manifest.contentHash ?? '',  // body hash will be recomputed from this
+            bodyHtml,
             manifest.videoFingerprint?.playbackId,
         );
         return { fp, wasStale: true };
@@ -257,6 +279,13 @@ async function runRefingerprint(outputDir: string, logger: Logger): Promise<void
     const entries = await fs.readdir(outputDir, { withFileTypes: true });
     let rebuilt = 0;
     let skipped = 0;
+
+    // Collect every group dir that contains a touched course so we can stamp
+    // fp_schema=2 on .group-log.json after the walk (P0-5 fix).
+    // A "group dir" is the parent of outputDir (i.e. outputDir itself when the
+    // user passes the group root, or path.dirname(outputDir) otherwise).
+    // We stamp the parent of each course dir that contained at least one lesson.
+    const touchedGroupDirs = new Set<string>();
 
     // Walk at most 2 levels deep (module/lesson or root/lesson)
     async function processDir(dir: string) {
@@ -286,15 +315,24 @@ async function runRefingerprint(outputDir: string, logger: Logger): Promise<void
                         continue;
                     }
 
+                    // Read saved HTML from disk so bodyHash is computed from actual content.
+                    // If index.html is absent, pass null — bodyHash will be null in the fp.
+                    const indexHtmlPath = path.join(subDir, 'index.html');
+                    const bodyHtml: string | null = fs.existsSync(indexHtmlPath)
+                        ? await fs.readFile(indexHtmlPath, 'utf8').catch(() => null)
+                        : null;
                     const fp = await computeFullFingerprint(
                         existingVideoPath,
-                        '',
+                        bodyHtml,
                         manifest.videoFingerprint?.playbackId,
                     );
                     const updatedManifest: LessonManifest = { ...manifest, fullFingerprint: fp };
                     await writeAtomicJson(manifestPath, updatedManifest);
                     await writeFingerprintSidecar(subDir, fp);
                     rebuilt += 1;
+                    // Track the group dir (parent of the course dir) so we can
+                    // stamp fp_schema=2 on .group-log.json after the walk.
+                    touchedGroupDirs.add(path.dirname(path.dirname(subDir)));
                     logger.info(`  ✅ Re-fingerprinted: ${manifest.title}`);
                 } catch (err) {
                     logger.warn(`  ⚠️ Failed to re-fingerprint ${subDir}: ${String(err)}`);
@@ -310,6 +348,18 @@ async function runRefingerprint(outputDir: string, logger: Logger): Promise<void
     for (const entry of entries) {
         if (entry.isDirectory() && !entry.name.startsWith('.')) {
             await processDir(path.join(outputDir, entry.name));
+        }
+    }
+
+    // Stamp fp_schema=2 on every touched group's .group-log.json (P0-5 fix).
+    // --refingerprint previously early-returned before mergeRunIntoLog, so the
+    // group log never got the fp_schema stamp that --update relies on.
+    for (const groupDir of touchedGroupDirs) {
+        try {
+            await stampFpSchema(groupDir);
+            logger.info(`  📝 Stamped fp_schema=2 on ${groupDir}/.group-log.json`);
+        } catch (err) {
+            logger.warn(`  ⚠️ Failed to stamp group log at ${groupDir}: ${String(err)}`);
         }
     }
 
@@ -696,7 +746,11 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                 }
                 process.stderr.write('\n');
 
-                process.exit(2);
+                // Throw instead of process.exit(2) so the finally block runs
+                // scraper.close() before Node exits (P0-4: prevents Playwright leak).
+                throw new SanityCheckAbort(
+                    `Sanity-check abort — ${videosNew} of ${totalPrior + videosNew} lessons have no prior manifest`
+                );
             }
         }
 
@@ -766,6 +820,10 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             let videoChanged = false;
                             let videoWasNewlyDownloaded = false;
                             let videoFingerprint: VideoFingerprint | undefined = oldManifest?.videoFingerprint;
+                            // Tracks the freshest FullFingerprint computed during this lesson run.
+                            // Hoisted here so the manifest-write below can always use the latest value
+                            // rather than the stale oldManifest.fullFingerprint (P0-2 fix).
+                            let lastComputedFullFp: FullFingerprint | null = null;
                             if (lessonData.videoLink) {
                                 const videoPath = path.join(lessonDir, 'video.mp4');
                                 const hevcPath = path.join(lessonDir, 'video.hevc.mp4');
@@ -799,6 +857,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                                 lessonData.contentHtml ?? '',
                                                 newFp?.playbackId ?? lessonData.muxPlaybackId,
                                             );
+                                            lastComputedFullFp = fullFp;
                                             videoFingerprint = newFp ?? undefined;
                                             const updatedManifest = oldManifest
                                                 ? { ...oldManifest, fullFingerprint: fullFp }
@@ -828,6 +887,8 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                                 lessonData.contentHtml ?? '',
                                                 newFp?.playbackId ?? lessonData.muxPlaybackId,
                                             );
+                                            // Track for manifest write (P0-2: persist freshly rebuilt fp)
+                                            lastComputedFullFp = currentFullFp;
                                         } catch {
                                             // Fall back to legacy equality check below
                                         }
@@ -845,19 +906,29 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                                 shouldRedownload = true;
                                             } else if (verdict.state === 'MINOR_CHANGE') {
                                                 // Ambiguous: escalate to perceptual signals (Phase 3)
+                                                // Cache hit: if prior perceptual data exists and L1–L3 agree,
+                                                // reuse stored data and skip expensive ffmpeg/fpcalc.
+                                                const priorPerceptual: PerceptualFingerprint | null =
+                                                    priorFullFp.perceptual ?? null;
+                                                const hasCachedPerceptual =
+                                                    priorPerceptual !== null &&
+                                                    priorPerceptual !== undefined;
                                                 try {
                                                     const durationMs = currentFullFp.ffprobe?.durationMs ?? 0;
-                                                    const priorPerceptual: PerceptualFingerprint | null =
-                                                        (priorFullFp as unknown as { perceptual?: PerceptualFingerprint }).perceptual ?? null;
-                                                    const escalation = await escalatedScore(localVideoPath, priorPerceptual, durationMs);
+                                                    const escalation = await escalatedScore(
+                                                        localVideoPath,
+                                                        priorPerceptual,
+                                                        durationMs,
+                                                    );
+                                                    // Store the freshly computed perceptual data (P0-3 fix:
+                                                    // replaces empty stubs with real frames/audio).
+                                                    currentFullFp.perceptual = escalation.computed;
+                                                    lastComputedFullFp = currentFullFp;
                                                     if (escalation.perceptualScore >= 4) {
                                                         shouldRedownload = false;
-                                                        videoStateLabel = 'UNCHANGED(perceptual)';
-                                                        // Attach perceptual fingerprint to current fp for storage
-                                                        (currentFullFp as unknown as { perceptual?: PerceptualFingerprint }).perceptual = {
-                                                            frames: null,
-                                                            audio: null,
-                                                        };
+                                                        videoStateLabel = hasCachedPerceptual
+                                                            ? 'UNCHANGED(perceptual-cached)'
+                                                            : 'UNCHANGED(perceptual)';
                                                     } else {
                                                         shouldRedownload = false; // MINOR_CHANGE: don't re-download unless REPLACED
                                                         videoStateLabel = 'MINOR_CHANGE';
@@ -899,6 +970,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                                     );
                                                     await writeFingerprintSidecar(lessonDir, freshFp);
                                                     currentFullFp = freshFp;
+                                                    lastComputedFullFp = freshFp;
                                                 } catch {
                                                     // Non-fatal
                                                 }
@@ -1115,7 +1187,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             // Carry forward any full fingerprint computed during video check.
                             // For new lessons without video, fullFingerprint stays undefined.
                             const fullFingerprintForManifest: FullFingerprint | undefined =
-                                oldManifest?.fullFingerprint ?? undefined;
+                                lastComputedFullFp ?? oldManifest?.fullFingerprint ?? undefined;
 
                             const lessonManifest: LessonManifest = {
                                 lessonId: lesson.id,

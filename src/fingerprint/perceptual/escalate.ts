@@ -12,6 +12,8 @@ import type {
   PerceptualFingerprint,
   EscalationVerdict,
   SignalVerdict,
+  FrameHashes,
+  AudioFingerprint,
 } from "./types.js";
 
 // ---------------------------------------------------------------------------
@@ -87,11 +89,17 @@ function verdictToScore(
  * @param prior       Previously stored PerceptualFingerprint (or null if first run).
  * @param durationMs  Video duration in milliseconds (from ffprobe L2).
  */
+/** Extended verdict that also carries the freshly computed perceptual data for storage. */
+export type EscalationVerdictWithData = EscalationVerdict & {
+  /** Freshly computed perceptual fingerprint for this video — persist into FullFingerprint. */
+  computed: PerceptualFingerprint;
+};
+
 export async function escalatedScore(
   videoPath: string,
   prior: PerceptualFingerprint | null,
   durationMs: number
-): Promise<EscalationVerdict> {
+): Promise<EscalationVerdictWithData> {
   const [currentFrames, currentAudio] = await Promise.all([
     frameHashes(videoPath, durationMs),
     audioFingerprint(videoPath, durationMs),
@@ -125,5 +133,12 @@ export async function escalatedScore(
     verdictToScore(frameVerdict, 2, 1) +
     verdictToScore(audioVerdict, 3, 1);
 
-  return { frameVerdict, audioVerdict, perceptualScore };
+  // Return the freshly computed frames/audio so the caller can persist them
+  // into FullFingerprint.perceptual, avoiding repeat expensive ffmpeg/fpcalc runs.
+  const computed: PerceptualFingerprint = {
+    frames: currentFrames,
+    audio: currentAudio,
+  };
+
+  return { frameVerdict, audioVerdict, perceptualScore, computed };
 }

@@ -3,7 +3,7 @@ import pc from 'picocolors';
 import path from 'path';
 import fs from 'fs-extra';
 import { Listr, PRESET_TIMER } from 'listr2';
-import { downloadCourse, type DownloadMode } from './index.js';
+import { downloadCourse, SanityCheckAbort, type DownloadMode } from './index.js';
 import { login, getAuthStatus } from './auth.js';
 import { regenerateIndex } from './regenerate-index.js';
 import { regenerateGroupIndex } from './regenerate-group-index.js';
@@ -665,6 +665,11 @@ async function main() {
 }
 
 main().catch((error) => {
+    // SanityCheckAbort is thrown inside downloadCourse's try block so that
+    // the finally { scraper.close() } runs before we exit (P0-4 fix).
+    if (error instanceof SanityCheckAbort) {
+        process.exit(error.exitCode);
+    }
     console.error('❌ An error occurred:', error);
     process.exit(1);
 });

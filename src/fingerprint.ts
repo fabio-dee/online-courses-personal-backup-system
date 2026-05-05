@@ -108,7 +108,10 @@ export type LessonManifestFullFingerprintExtension = {
  */
 export async function computeFullFingerprint(
     videoPath: string,
-    bodyHtml: string,
+    // Pass the raw HTML string, or null if index.html is not available on disk.
+    // When null, bodyHash is stored as null so scoreBody treats it as UNKNOWN
+    // rather than producing a false MINOR mismatch against a real hash.
+    bodyHtml: string | null,
     existingPlaybackId?: string,
 ): Promise<FullFingerprint> {
     const [ffprobeResult, chunksResult] = await Promise.all([
@@ -121,6 +124,6 @@ export async function computeFullFingerprint(
         playbackId: existingPlaybackId,
         ffprobe: ffprobeResult,
         chunks: chunksResult,
-        bodyHash: bodyHash(bodyHtml),
+        bodyHash: bodyHtml !== null ? bodyHash(bodyHtml) : null,
     };
 }
