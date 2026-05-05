@@ -3,7 +3,16 @@ import { Downloader } from './downloader.js';
 import { regenerateIndex } from './regenerate-index.js';
 import { regenerateGroupIndex } from './regenerate-group-index.js';
 import { createConsoleLogger, type Logger } from './logger.js';
-import { computeContentHash, videoFingerprintsEqual, type VideoFingerprint } from './fingerprint.js';
+import {
+    computeContentHash,
+    videoFingerprintsEqual,
+    computeFullFingerprint,
+    type VideoFingerprint,
+    type FullFingerprint,
+} from './fingerprint.js';
+import { scoreVideo, scoreBody } from './fingerprint/score.js';
+import { escalatedScore } from './fingerprint/perceptual/escalate.js';
+import type { PerceptualFingerprint } from './fingerprint/perceptual/types.js';
 import {
     createRunStats,
     mergeRunIntoLog,
@@ -79,6 +88,8 @@ type LessonManifest = {
     updatedAt: string;
     contentHash?: string;
     videoFingerprint?: VideoFingerprint;
+    /** Phase 2+ full fingerprint. Present when fp_schema=2. */
+    fullFingerprint?: FullFingerprint;
     firstDownloadedAt?: string;
     lastCheckedAt?: string;
     lastTextChangedAt?: string;
@@ -140,6 +151,12 @@ export type DownloadOptions = {
     update?: boolean;
     /** Skip the sanity-check abort even when >30% of prior lessons are flagged new. */
     forceUpdate?: boolean;
+    /**
+     * When true: rebuild every lesson's FullFingerprint from local disk (no network),
+     * write updated lesson.json + lesson.fingerprint.json sidecars, then exit.
+     * No scraping, no downloading.
+     */
+    refingerprint?: boolean;
 };
 
 export type DownloadSummary = {
@@ -162,6 +179,141 @@ async function writeAtomicJson(filePath: string, data: unknown) {
     const tempPath = `${filePath}.tmp`;
     await fs.writeJson(tempPath, data, { spaces: 2 });
     await fs.move(tempPath, filePath, { overwrite: true });
+}
+
+/** Write (or overwrite) the per-lesson sidecar fingerprint file. */
+async function writeFingerprintSidecar(lessonDir: string, fp: FullFingerprint): Promise<void> {
+    await writeAtomicJson(path.join(lessonDir, 'lesson.fingerprint.json'), fp);
+}
+
+/**
+ * Read the sidecar fingerprint for a lesson dir, preferring sidecar over in-manifest copy.
+ * Returns null if neither exists or sidecar is unparseable.
+ */
+async function readFingerprintSidecar(lessonDir: string): Promise<FullFingerprint | null> {
+    const sidecarPath = path.join(lessonDir, 'lesson.fingerprint.json');
+    if (!fs.existsSync(sidecarPath)) return null;
+    try {
+        const data = await fs.readJson(sidecarPath) as unknown;
+        if (
+            typeof data === 'object' && data !== null &&
+            (data as { fp_schema?: unknown }).fp_schema === 2
+        ) {
+            return data as FullFingerprint;
+        }
+    } catch {
+        // Ignore corrupt sidecar; fall through to null
+    }
+    return null;
+}
+
+/**
+ * Load or lazily rebuild a FullFingerprint for an existing lesson.
+ * Returns { fp, wasStale } — wasStale=true means it was rebuilt from disk.
+ * NEVER treats a stale lesson as new; always returns an fp if video exists.
+ */
+async function loadOrRebuildFingerprint(
+    lessonDir: string,
+    manifest: LessonManifest,
+): Promise<{ fp: FullFingerprint | null; wasStale: boolean }> {
+    // Prefer sidecar over in-manifest copy
+    const sidecar = await readFingerprintSidecar(lessonDir);
+    if (sidecar !== null) {
+        return { fp: sidecar, wasStale: false };
+    }
+    if (manifest.fullFingerprint?.fp_schema === 2) {
+        return { fp: manifest.fullFingerprint, wasStale: false };
+    }
+
+    // Stale: rebuild from disk (no network)
+    const videoPath = path.join(lessonDir, 'video.mp4');
+    const hevcPath = path.join(lessonDir, 'video.hevc.mp4');
+    const existingVideoPath = [videoPath, hevcPath].find(
+        p => fs.existsSync(p) && fs.statSync(p).size > 0
+    );
+    if (!existingVideoPath) {
+        return { fp: null, wasStale: true };
+    }
+
+    try {
+        const fp = await computeFullFingerprint(
+            existingVideoPath,
+            manifest.contentHash ?? '',  // body hash will be recomputed from this
+            manifest.videoFingerprint?.playbackId,
+        );
+        return { fp, wasStale: true };
+    } catch {
+        return { fp: null, wasStale: true };
+    }
+}
+
+/**
+ * Run the --refingerprint pass: scan all existing lesson.json files under outputDir,
+ * rebuild FullFingerprint from disk for each, write updated lesson.json + sidecar.
+ * No scraping, no downloading.
+ */
+async function runRefingerprint(outputDir: string, logger: Logger): Promise<void> {
+    logger.info('🔬 --refingerprint: scanning vault for lessons to re-fingerprint...');
+    const entries = await fs.readdir(outputDir, { withFileTypes: true });
+    let rebuilt = 0;
+    let skipped = 0;
+
+    // Walk at most 2 levels deep (module/lesson or root/lesson)
+    async function processDir(dir: string) {
+        let items: fs.Dirent[];
+        try {
+            items = await fs.readdir(dir, { withFileTypes: true });
+        } catch {
+            return;
+        }
+        for (const item of items) {
+            if (!item.isDirectory()) continue;
+            const subDir = path.join(dir, item.name);
+            const manifestPath = path.join(subDir, 'lesson.json');
+            if (fs.existsSync(manifestPath)) {
+                // This is a lesson dir
+                try {
+                    const manifest = await fs.readJson(manifestPath) as LessonManifest;
+                    if (!manifest.lessonId) continue;
+
+                    const videoPath = path.join(subDir, 'video.mp4');
+                    const hevcPath = path.join(subDir, 'video.hevc.mp4');
+                    const existingVideoPath = [videoPath, hevcPath].find(
+                        p => fs.existsSync(p) && fs.statSync(p).size > 0
+                    );
+                    if (!existingVideoPath) {
+                        skipped += 1;
+                        continue;
+                    }
+
+                    const fp = await computeFullFingerprint(
+                        existingVideoPath,
+                        '',
+                        manifest.videoFingerprint?.playbackId,
+                    );
+                    const updatedManifest: LessonManifest = { ...manifest, fullFingerprint: fp };
+                    await writeAtomicJson(manifestPath, updatedManifest);
+                    await writeFingerprintSidecar(subDir, fp);
+                    rebuilt += 1;
+                    logger.info(`  ✅ Re-fingerprinted: ${manifest.title}`);
+                } catch (err) {
+                    logger.warn(`  ⚠️ Failed to re-fingerprint ${subDir}: ${String(err)}`);
+                    skipped += 1;
+                }
+            } else {
+                // Might be a module dir — recurse one level
+                await processDir(subDir);
+            }
+        }
+    }
+
+    for (const entry of entries) {
+        if (entry.isDirectory() && !entry.name.startsWith('.')) {
+            await processDir(path.join(outputDir, entry.name));
+        }
+    }
+
+    logger.info(`🔬 --refingerprint complete: ${rebuilt} rebuilt, ${skipped} skipped (no video).`);
 }
 
 function getUrlExtension(url: string) {
@@ -234,6 +386,26 @@ async function runConcurrent(tasks: Array<() => Promise<void>>, concurrency: num
 
 export async function downloadCourse(options: DownloadOptions): Promise<DownloadSummary> {
     const logger = options.logger ?? createConsoleLogger();
+
+    // --refingerprint: rebuild all fingerprints from disk, no network needed.
+    if (options.refingerprint) {
+        const outputDir = options.outputDir && options.outputDir !== 'undefined'
+            ? options.outputDir
+            : path.join(process.cwd(), 'downloads');
+        await runRefingerprint(outputDir, logger);
+        // Return a minimal summary — caller doesn't use it in this mode.
+        return {
+            courseName: '',
+            groupName: '',
+            outputDir,
+            modulesCount: 0,
+            lessonsCount: 0,
+            completedLessons: 0,
+            failedLessons: 0,
+            targetLessonId: null,
+        };
+    }
+
     const concurrency = normalizeConcurrency(options.concurrency);
     const mode = options.mode ?? 'auto';
     const inputUrl = options.url.replace(/\\/g, '');
@@ -609,38 +781,144 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                         newFp.playbackId = lessonData.muxPlaybackId;
                                     }
 
+                                    const localVideoPath = [videoPath, hevcPath].find(
+                                        p => fs.existsSync(p) && fs.statSync(p).size > 0
+                                    ) ?? videoPath;
+
                                     const hasBaseline = oldManifest?.videoFingerprint != null;
-                                    if (newFp && !hasBaseline) {
+
+                                    if (!hasBaseline) {
+                                        // First --update run: record fingerprint, trust local file.
                                         logger.info(`    📝 Recording video fingerprint (first --update, trusting local file)`);
                                         hasVideo = true;
-                                        videoFingerprint = newFp;
-                                    } else if (newFp && hasBaseline && !videoFingerprintsEqual(newFp, oldManifest!.videoFingerprint)) {
-                                        logger.info(`    🔄 Video changed — re-downloading`);
-                                        const backupPath = `${videoPath}.bak`;
-                                        await fs.move(videoPath, backupPath, { overwrite: true });
+                                        videoFingerprint = newFp ?? undefined;
+                                        // Compute and store full fingerprint for future runs.
                                         try {
-                                            updateStatus('Downloading video...');
-                                            await downloader.downloadVideo(lessonData.videoLink, lessonDir, 'video');
-                                            await fs.remove(backupPath);
-                                            hasVideo = true;
-                                            videoFingerprint = newFp;
-                                            videoChanged = true;
-                                        } catch (err) {
-                                            logger.warn(`    ⚠️ Video re-download failed; restoring previous file`);
-                                            if (fs.existsSync(backupPath)) {
-                                                await fs.move(backupPath, videoPath, { overwrite: true });
+                                            const fullFp = await computeFullFingerprint(
+                                                localVideoPath,
+                                                lessonData.contentHtml ?? '',
+                                                newFp?.playbackId ?? lessonData.muxPlaybackId,
+                                            );
+                                            videoFingerprint = newFp ?? undefined;
+                                            const updatedManifest = oldManifest
+                                                ? { ...oldManifest, fullFingerprint: fullFp }
+                                                : null;
+                                            if (updatedManifest) {
+                                                await writeAtomicJson(path.join(lessonDir, 'lesson.json'), updatedManifest);
                                             }
-                                            hasVideo = true;
-                                            videoFingerprint = oldManifest?.videoFingerprint;
+                                            await writeFingerprintSidecar(lessonDir, fullFp);
+                                        } catch {
+                                            // Non-fatal: legacy path still works
                                         }
                                     } else {
-                                        if (newFp) {
-                                            logger.info(`    ⏭️  Video unchanged (fingerprint match)`);
-                                        } else {
-                                            logger.warn(`    ⚠️ Could not verify video freshness; keeping existing file`);
+                                        // Defense-in-depth: use full scoring engine when available.
+                                        const { fp: priorFullFp, wasStale } = await loadOrRebuildFingerprint(lessonDir, oldManifest!);
+
+                                        if (wasStale && priorFullFp) {
+                                            // Write rebuilt fingerprint back to disk before comparing.
+                                            await writeFingerprintSidecar(lessonDir, priorFullFp);
                                         }
-                                        hasVideo = true;
-                                        videoFingerprint = newFp ?? oldManifest?.videoFingerprint;
+
+                                        // Build current full fingerprint from the remote lightweight fp
+                                        // plus local file signals.
+                                        let currentFullFp: FullFingerprint | null = null;
+                                        try {
+                                            currentFullFp = await computeFullFingerprint(
+                                                localVideoPath,
+                                                lessonData.contentHtml ?? '',
+                                                newFp?.playbackId ?? lessonData.muxPlaybackId,
+                                            );
+                                        } catch {
+                                            // Fall back to legacy equality check below
+                                        }
+
+                                        let shouldRedownload = false;
+                                        let videoStateLabel = 'UNKNOWN';
+
+                                        if (priorFullFp && currentFullFp) {
+                                            const verdict = scoreVideo(priorFullFp, currentFullFp);
+                                            videoStateLabel = verdict.state;
+
+                                            if (verdict.state === 'UNCHANGED') {
+                                                shouldRedownload = false;
+                                            } else if (verdict.state === 'REPLACED') {
+                                                shouldRedownload = true;
+                                            } else if (verdict.state === 'MINOR_CHANGE') {
+                                                // Ambiguous: escalate to perceptual signals (Phase 3)
+                                                try {
+                                                    const durationMs = currentFullFp.ffprobe?.durationMs ?? 0;
+                                                    const priorPerceptual: PerceptualFingerprint | null =
+                                                        (priorFullFp as unknown as { perceptual?: PerceptualFingerprint }).perceptual ?? null;
+                                                    const escalation = await escalatedScore(localVideoPath, priorPerceptual, durationMs);
+                                                    if (escalation.perceptualScore >= 4) {
+                                                        shouldRedownload = false;
+                                                        videoStateLabel = 'UNCHANGED(perceptual)';
+                                                        // Attach perceptual fingerprint to current fp for storage
+                                                        (currentFullFp as unknown as { perceptual?: PerceptualFingerprint }).perceptual = {
+                                                            frames: null,
+                                                            audio: null,
+                                                        };
+                                                    } else {
+                                                        shouldRedownload = false; // MINOR_CHANGE: don't re-download unless REPLACED
+                                                        videoStateLabel = 'MINOR_CHANGE';
+                                                    }
+                                                } catch {
+                                                    shouldRedownload = false; // Conservative: don't re-download on escalation failure
+                                                }
+                                            } else {
+                                                // UNKNOWN: treat as updated (re-download)
+                                                shouldRedownload = true;
+                                            }
+                                        } else {
+                                            // No full fingerprints available: fall back to legacy equality check
+                                            if (newFp && !videoFingerprintsEqual(newFp, oldManifest!.videoFingerprint)) {
+                                                shouldRedownload = true;
+                                                videoStateLabel = 'REPLACED(legacy)';
+                                            }
+                                        }
+
+                                        if (shouldRedownload) {
+                                            logger.info(`    🔄 Video changed (${videoStateLabel}) — re-downloading`);
+                                            const backupPath = `${videoPath}.bak`;
+                                            if (fs.existsSync(videoPath)) {
+                                                await fs.move(videoPath, backupPath, { overwrite: true });
+                                            }
+                                            try {
+                                                updateStatus('Downloading video...');
+                                                await downloader.downloadVideo(lessonData.videoLink, lessonDir, 'video');
+                                                if (fs.existsSync(backupPath)) await fs.remove(backupPath);
+                                                hasVideo = true;
+                                                videoFingerprint = newFp ?? undefined;
+                                                videoChanged = true;
+                                                // Compute fresh full fingerprint after re-download
+                                                try {
+                                                    const freshFp = await computeFullFingerprint(
+                                                        videoPath,
+                                                        lessonData.contentHtml ?? '',
+                                                        newFp?.playbackId ?? lessonData.muxPlaybackId,
+                                                    );
+                                                    await writeFingerprintSidecar(lessonDir, freshFp);
+                                                    currentFullFp = freshFp;
+                                                } catch {
+                                                    // Non-fatal
+                                                }
+                                            } catch (err) {
+                                                logger.warn(`    ⚠️ Video re-download failed; restoring previous file`);
+                                                if (fs.existsSync(backupPath)) {
+                                                    await fs.move(backupPath, videoPath, { overwrite: true });
+                                                }
+                                                hasVideo = true;
+                                                videoFingerprint = oldManifest?.videoFingerprint;
+                                            }
+                                        } else {
+                                            logger.info(`    ⏭️  Video unchanged (${videoStateLabel})`);
+                                            hasVideo = true;
+                                            videoFingerprint = newFp ?? oldManifest?.videoFingerprint;
+                                            // Persist refreshed full fingerprint
+                                            if (currentFullFp) {
+                                                await writeFingerprintSidecar(lessonDir, currentFullFp);
+                                            }
+                                        }
                                     }
                                 } else {
                                     try {
@@ -834,6 +1112,11 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                     ? now
                                     : oldManifest?.lastVideoChangedAt;
 
+                            // Carry forward any full fingerprint computed during video check.
+                            // For new lessons without video, fullFingerprint stays undefined.
+                            const fullFingerprintForManifest: FullFingerprint | undefined =
+                                oldManifest?.fullFingerprint ?? undefined;
+
                             const lessonManifest: LessonManifest = {
                                 lessonId: lesson.id,
                                 title: lesson.title,
@@ -850,6 +1133,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                 updatedAt: now,
                                 contentHash: newContentHash,
                                 videoFingerprint,
+                                fullFingerprint: fullFingerprintForManifest,
                                 firstDownloadedAt,
                                 lastCheckedAt,
                                 lastTextChangedAt,

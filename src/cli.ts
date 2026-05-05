@@ -20,6 +20,7 @@ type CliArgs = {
     regenerateDir?: string;
     update?: boolean;
     forceUpdate?: boolean;
+    refingerprint?: boolean;
     logGroupDir?: string;
     logSince?: string;
     logLast?: number;
@@ -87,6 +88,10 @@ function parseArgs(args: string[]): CliArgs {
         }
         if (arg === '--force-update') {
             parsed.forceUpdate = true;
+            continue;
+        }
+        if (arg === '--refingerprint') {
+            parsed.refingerprint = true;
             continue;
         }
         if (arg === '--lesson-id') {
@@ -639,13 +644,14 @@ async function runWithArgs(args: CliArgs) {
         }
 
         await downloadCourse({
-            url: args.url,
+            url: args.refingerprint ? 'https://placeholder' : args.url,
             outputDir: args.outputDir,
             concurrency: args.concurrency,
             mode: args.mode,
             lessonId: args.lessonId,
             update: args.update,
-            forceUpdate: args.forceUpdate
+            forceUpdate: args.forceUpdate,
+            refingerprint: args.refingerprint,
         });
         return;
     }
