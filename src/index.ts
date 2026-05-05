@@ -386,9 +386,26 @@ async function runRefingerprint(outputDir: string, logger: Logger, forceRefinger
                     await writeAtomicJson(manifestPath, updatedManifest);
                     await writeFingerprintSidecar(subDir, fp);
                     rebuilt += 1;
-                    // Track the group dir (parent of the course dir) so we can
-                    // stamp fp_schema=2 on .group-log.json after the walk.
-                    touchedGroupDirs.add(path.dirname(path.dirname(subDir)));
+                    // Walk up from the lesson dir until we find an EXISTING
+                    // .group-log.json with at least one lesson recorded. That
+                    // is the real group root. Avoids creating spurious empty
+                    // group-logs at every intermediate course/module dir.
+                    let probe = path.dirname(subDir);
+                    while (probe.startsWith(outputDir) && probe !== outputDir) {
+                        const candidate = path.join(probe, '.group-log.json');
+                        if (fs.existsSync(candidate)) {
+                            try {
+                                const log = await fs.readJson(candidate) as { lessons?: Record<string, unknown> };
+                                if (log.lessons && Object.keys(log.lessons).length > 0) {
+                                    touchedGroupDirs.add(probe);
+                                    break;
+                                }
+                            } catch {
+                                // Corrupt log — skip and keep walking up
+                            }
+                        }
+                        probe = path.dirname(probe);
+                    }
                     logger.info(`  ✅ Re-fingerprinted: ${manifest.title}`);
                 } catch (err) {
                     logger.warn(`  ⚠️ Failed to re-fingerprint ${subDir}: ${String(err)}`);
