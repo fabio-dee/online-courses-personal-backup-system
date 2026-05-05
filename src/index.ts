@@ -25,6 +25,19 @@ import fs from 'fs-extra';
 import path from 'path';
 import pLimit from 'p-limit';
 
+/**
+ * Thrown by the sanity-check when >30% of lessons have no prior manifest.
+ * Caught by the CLI entry point AFTER scraper.close() runs via the finally block,
+ * so Playwright is never leaked (P0-4 fix — replaces process.exit(2) inside try).
+ */
+export class SanityCheckAbort extends Error {
+    readonly exitCode = 2;
+    constructor(message: string) {
+        super(message);
+        this.name = 'SanityCheckAbort';
+    }
+}
+
 const DEFAULT_CONCURRENCY = 8;
 const MAX_CONCURRENCY = 16;
 
@@ -710,7 +723,11 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                 }
                 process.stderr.write('\n');
 
-                process.exit(2);
+                // Throw instead of process.exit(2) so the finally block runs
+                // scraper.close() before Node exits (P0-4: prevents Playwright leak).
+                throw new SanityCheckAbort(
+                    `Sanity-check abort — ${videosNew} of ${totalPrior + videosNew} lessons have no prior manifest`
+                );
             }
         }
 
