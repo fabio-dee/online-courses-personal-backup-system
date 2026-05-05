@@ -79,7 +79,11 @@ describe('scoreBody', () => {
         expect(scoreBody('abc', 'def')).toBe('MINOR');
     });
 
-    it('null → MINOR', () => {
-        expect(scoreBody(null, 'abc')).toBe('MINOR');
+    it('null on either side → UNCHANGED (P0-1: avoid false MINOR when index.html unavailable)', () => {
+        // null means the HTML was unavailable during offline rebuild; treat as UNCHANGED
+        // so we don't flag a false-positive body change.
+        expect(scoreBody(null, 'abc')).toBe('UNCHANGED');
+        expect(scoreBody('abc', null)).toBe('UNCHANGED');
+        expect(scoreBody(null, null)).toBe('UNCHANGED');
     });
 });
