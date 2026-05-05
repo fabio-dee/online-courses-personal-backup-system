@@ -235,10 +235,18 @@ async function loadOrRebuildFingerprint(
         return { fp: null, wasStale: true };
     }
 
+    // Read the saved HTML from disk so bodyHash is computed from actual content,
+    // not from manifest.contentHash which is already a sha256 hex string (wrong input).
+    // If index.html is absent, pass null and bodyHash will be null in the fp.
+    const indexHtmlPath = path.join(lessonDir, 'index.html');
+    const bodyHtml: string | null = fs.existsSync(indexHtmlPath)
+        ? await fs.readFile(indexHtmlPath, 'utf8').catch(() => null)
+        : null;
+
     try {
         const fp = await computeFullFingerprint(
             existingVideoPath,
-            manifest.contentHash ?? '',  // body hash will be recomputed from this
+            bodyHtml,
             manifest.videoFingerprint?.playbackId,
         );
         return { fp, wasStale: true };
@@ -286,9 +294,15 @@ async function runRefingerprint(outputDir: string, logger: Logger): Promise<void
                         continue;
                     }
 
+                    // Read saved HTML from disk so bodyHash is computed from actual content.
+                    // If index.html is absent, pass null — bodyHash will be null in the fp.
+                    const indexHtmlPath = path.join(subDir, 'index.html');
+                    const bodyHtml: string | null = fs.existsSync(indexHtmlPath)
+                        ? await fs.readFile(indexHtmlPath, 'utf8').catch(() => null)
+                        : null;
                     const fp = await computeFullFingerprint(
                         existingVideoPath,
-                        '',
+                        bodyHtml,
                         manifest.videoFingerprint?.playbackId,
                     );
                     const updatedManifest: LessonManifest = { ...manifest, fullFingerprint: fp };

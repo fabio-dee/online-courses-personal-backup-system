@@ -141,6 +141,9 @@ export function scoreVideo(
 }
 
 export function scoreBody(priorHash: string | null, currentHash: string | null): BodyState {
-    if (priorHash === null || currentHash === null) return 'MINOR';
+    // Null on either side means the HTML was unavailable when the fingerprint was computed
+    // (e.g. offline rebuild without index.html). Treat as UNKNOWN → UNCHANGED to avoid
+    // false-positive MINOR mismatches. Only flag MINOR when both hashes are present and differ.
+    if (priorHash === null || currentHash === null) return 'UNCHANGED';
     return priorHash === currentHash ? 'UNCHANGED' : 'MINOR';
 }
