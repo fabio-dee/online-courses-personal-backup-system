@@ -204,7 +204,24 @@ async function writeFingerprintSidecar(lessonDir: string, fp: FullFingerprint): 
  * Read the sidecar fingerprint for a lesson dir, preferring sidecar over in-manifest copy.
  * Returns null if neither exists or sidecar is unparseable.
  */
-async function readFingerprintSidecar(lessonDir: string): Promise<FullFingerprint | null> {
+/**
+ * P1-3: Validate that a parsed sidecar object has the required top-level keys
+ * before trusting it. Returns true only when all four required fields are present
+ * with acceptable types (object|null for ffprobe/chunks, string|null for bodyHash/playbackId).
+ */
+function isFingerprintShapeValid(data: Record<string, unknown>): boolean {
+    // ffprobe: object or null
+    if (!('ffprobe' in data) || (data['ffprobe'] !== null && typeof data['ffprobe'] !== 'object')) return false;
+    // chunks: object or null
+    if (!('chunks' in data) || (data['chunks'] !== null && typeof data['chunks'] !== 'object')) return false;
+    // bodyHash: string or null
+    if (!('bodyHash' in data) || (data['bodyHash'] !== null && typeof data['bodyHash'] !== 'string')) return false;
+    // playbackId: string or null
+    if (!('playbackId' in data) || (data['playbackId'] !== null && typeof data['playbackId'] !== 'string')) return false;
+    return true;
+}
+
+async function readFingerprintSidecar(lessonDir: string, logger?: Logger): Promise<FullFingerprint | null> {
     const sidecarPath = path.join(lessonDir, 'lesson.fingerprint.json');
     if (!fs.existsSync(sidecarPath)) return null;
     try {
@@ -213,6 +230,13 @@ async function readFingerprintSidecar(lessonDir: string): Promise<FullFingerprin
             typeof data === 'object' && data !== null &&
             (data as { fp_schema?: unknown }).fp_schema === 2
         ) {
+            // P1-3: Guard against truncated sidecars that pass fp_schema check but
+            // are missing required keys — they crash later in scoreVideo/scoreBody.
+            const rec = data as Record<string, unknown>;
+            if (!isFingerprintShapeValid(rec)) {
+                logger?.warn(`    ⚠️  Sidecar at ${sidecarPath} is missing required keys — treating as absent`);
+                return null;
+            }
             return data as FullFingerprint;
         }
     } catch {
@@ -806,7 +830,8 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
 
                             const newContentHash = computeContentHash(lessonData);
                             const isNewLesson = oldManifest == null;
-                            const textChanged = !isNewLesson && oldManifest?.contentHash !== newContentHash;
+                            // textChanged starts as legacy hash comparison; may be upgraded by scoreBody below.
+                            let textChanged = !isNewLesson && oldManifest?.contentHash !== newContentHash;
 
                             stats.textsChecked += 1;
                             if (lessonData.videoLink) {
@@ -893,6 +918,19 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                             // Fall back to legacy equality check below
                                         }
 
+                                        // P1-1: Wire scoreBody into body change detection.
+                                        // scoreBody returns UNCHANGED when either hash is null (no false positives).
+                                        // If MINOR, upgrade textChanged regardless of legacy hash comparison.
+                                        if (!isNewLesson && currentFullFp !== null) {
+                                            const bodyVerdict = scoreBody(
+                                                priorFullFp?.bodyHash ?? null,
+                                                currentFullFp.bodyHash,
+                                            );
+                                            if (bodyVerdict === 'MINOR') {
+                                                textChanged = true;
+                                            }
+                                        }
+
                                         let shouldRedownload = false;
                                         let videoStateLabel = 'UNKNOWN';
 
@@ -924,14 +962,27 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                                     // replaces empty stubs with real frames/audio).
                                                     currentFullFp.perceptual = escalation.computed;
                                                     lastComputedFullFp = currentFullFp;
+                                                    // P1-2: perceptual score tiers (Phase 3 doc):
+                                                    //   ≥4 → UNCHANGED (perceptual confirms same video)
+                                                    //   2–3 → ambiguous (log warning, don't re-download)
+                                                    //   ≤1 → REPLACED (perceptual says different video)
                                                     if (escalation.perceptualScore >= 4) {
                                                         shouldRedownload = false;
                                                         videoStateLabel = hasCachedPerceptual
                                                             ? 'UNCHANGED(perceptual-cached)'
                                                             : 'UNCHANGED(perceptual)';
+                                                    } else if (escalation.perceptualScore <= 1) {
+                                                        // Perceptual signals confirm replacement — upgrade verdict.
+                                                        shouldRedownload = true;
+                                                        videoStateLabel = 'REPLACED(perceptual)';
                                                     } else {
-                                                        shouldRedownload = false; // MINOR_CHANGE: don't re-download unless REPLACED
+                                                        // Score 2–3: ambiguous; keep MINOR_CHANGE, log a warning.
+                                                        shouldRedownload = false;
                                                         videoStateLabel = 'MINOR_CHANGE';
+                                                        logger.warn(
+                                                            `    ⚠️  Ambiguous perceptual score (${escalation.perceptualScore}/5) for lesson "${lesson.title}" — ` +
+                                                            `manual inspection recommended. Re-run with --force-update to force re-download.`
+                                                        );
                                                     }
                                                 } catch {
                                                     shouldRedownload = false; // Conservative: don't re-download on escalation failure
@@ -1277,10 +1328,55 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
             }
         }
 
-        if (options.runTasks) {
-            await options.runTasks(tasks, concurrency);
-        } else {
-            await runConcurrent(tasks.map(task => () => task.run()), concurrency);
+        // P1-4: Progress counter — emit a line every 25 lessons OR every 30 seconds.
+        // Lets the user track long runs (e.g. 1318-lesson vaults) without spam.
+        const progressStartMs = Date.now();
+        let lastProgressLessons = 0;
+        let lastProgressMs = progressStartMs;
+        const PROGRESS_EVERY_N = 25;
+        const PROGRESS_EVERY_MS = 30_000;
+
+        function emitProgress(): void {
+            const done = completedLessons;
+            const total = totalLessons;
+            const elapsedMs = Date.now() - progressStartMs;
+            const unchanged = done - stats.textsNew - stats.textsUpdated - stats.videosUpdated;
+            const stale = stats.textsNew;
+            const updated = stats.textsUpdated + stats.videosUpdated;
+            const etaStr = done > 0
+                ? (() => {
+                    const msPerLesson = elapsedMs / done;
+                    const remaining = Math.round((total - done) * msPerLesson / 60_000);
+                    return remaining < 1 ? '<1 min' : `~${remaining} min`;
+                })()
+                : '?';
+            logger.info(
+                `🔄 Classified ${done}/${total} lessons` +
+                ` (${Math.max(0, unchanged)} unchanged, ${stale} new, ${updated} updated)` +
+                ` ETA ${etaStr}`
+            );
+        }
+
+        const progressTimer = setInterval(() => {
+            const done = completedLessons;
+            const nowMs = Date.now();
+            const lessonsBump = done - lastProgressLessons;
+            const timeBump = nowMs - lastProgressMs;
+            if (lessonsBump >= PROGRESS_EVERY_N || timeBump >= PROGRESS_EVERY_MS) {
+                emitProgress();
+                lastProgressLessons = done;
+                lastProgressMs = nowMs;
+            }
+        }, 5_000); // poll every 5 s; actual emit gated by the thresholds above
+
+        try {
+            if (options.runTasks) {
+                await options.runTasks(tasks, concurrency);
+            } else {
+                await runConcurrent(tasks.map(task => () => task.run()), concurrency);
+            }
+        } finally {
+            clearInterval(progressTimer);
         }
         await indexLimit(() => regenerateIndex(baseOutputDir, { silent: options.suppressIndexLogs }));
         const groupDir = activeGroupDir ?? path.dirname(baseOutputDir);
