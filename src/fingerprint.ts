@@ -1,5 +1,11 @@
 import crypto from 'crypto';
 import type { Lesson, Resource } from './scraper.js';
+import type { FullFingerprint } from './fingerprint/types.js';
+import { probeVideo } from './fingerprint/ffprobe.js';
+import { chunkHashes } from './fingerprint/chunks.js';
+import { bodyHash } from './fingerprint/body.js';
+
+export type { FullFingerprint } from './fingerprint/types.js';
 
 export type VideoSource = 'youtube' | 'loom' | 'mux' | 'other';
 
@@ -72,4 +78,49 @@ export function videoFingerprintsEqual(a?: VideoFingerprint, b?: VideoFingerprin
     }
 
     return true;
+}
+
+/**
+ * LessonManifest extension — carries the optional full fingerprint alongside the
+ * existing lightweight VideoFingerprint. Phase 1's two-pass classifier will write
+ * this field; Phase 2's scoring engine reads it.
+ */
+export type LessonManifestFullFingerprintExtension = {
+    fp_schema?: 2;
+    fullFingerprint?: FullFingerprint;
+};
+
+/**
+ * Compute a full Phase-2 fingerprint for a lesson.
+ *
+ * Phase 1 integration seam — call this after the local video file is confirmed
+ * present on disk, before the equality check:
+ *
+ *   const full = await computeFullFingerprint(videoPath, lessonData.contentHtml ?? '', playbackId);
+ *
+ * Then pass `oldManifest.fullFingerprint` and `full` into `scoreVideo()` from
+ * `src/fingerprint/score.ts` to obtain a `VideoVerdict`.
+ *
+ * @param videoPath       Absolute path to the local .mp4 / .webm file.
+ * @param bodyHtml        Raw HTML string of lesson.contentHtml (may be empty).
+ * @param existingPlaybackId  Mux playback ID already extracted from the video URL,
+ *                            if available (passed through unchanged).
+ */
+export async function computeFullFingerprint(
+    videoPath: string,
+    bodyHtml: string,
+    existingPlaybackId?: string,
+): Promise<FullFingerprint> {
+    const [ffprobeResult, chunksResult] = await Promise.all([
+        probeVideo(videoPath),
+        chunkHashes(videoPath).catch(() => null),
+    ]);
+
+    return {
+        fp_schema: 2,
+        playbackId: existingPlaybackId,
+        ffprobe: ffprobeResult,
+        chunks: chunksResult,
+        bodyHash: bodyHash(bodyHtml),
+    };
 }
