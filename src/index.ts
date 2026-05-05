@@ -780,6 +780,10 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             let videoChanged = false;
                             let videoWasNewlyDownloaded = false;
                             let videoFingerprint: VideoFingerprint | undefined = oldManifest?.videoFingerprint;
+                            // Tracks the freshest FullFingerprint computed during this lesson run.
+                            // Hoisted here so the manifest-write below can always use the latest value
+                            // rather than the stale oldManifest.fullFingerprint (P0-2 fix).
+                            let lastComputedFullFp: FullFingerprint | null = null;
                             if (lessonData.videoLink) {
                                 const videoPath = path.join(lessonDir, 'video.mp4');
                                 const hevcPath = path.join(lessonDir, 'video.hevc.mp4');
@@ -813,6 +817,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                                 lessonData.contentHtml ?? '',
                                                 newFp?.playbackId ?? lessonData.muxPlaybackId,
                                             );
+                                            lastComputedFullFp = fullFp;
                                             videoFingerprint = newFp ?? undefined;
                                             const updatedManifest = oldManifest
                                                 ? { ...oldManifest, fullFingerprint: fullFp }
@@ -842,6 +847,8 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                                 lessonData.contentHtml ?? '',
                                                 newFp?.playbackId ?? lessonData.muxPlaybackId,
                                             );
+                                            // Track for manifest write (P0-2: persist freshly rebuilt fp)
+                                            lastComputedFullFp = currentFullFp;
                                         } catch {
                                             // Fall back to legacy equality check below
                                         }
@@ -913,6 +920,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                                     );
                                                     await writeFingerprintSidecar(lessonDir, freshFp);
                                                     currentFullFp = freshFp;
+                                                    lastComputedFullFp = freshFp;
                                                 } catch {
                                                     // Non-fatal
                                                 }
@@ -1129,7 +1137,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             // Carry forward any full fingerprint computed during video check.
                             // For new lessons without video, fullFingerprint stays undefined.
                             const fullFingerprintForManifest: FullFingerprint | undefined =
-                                oldManifest?.fullFingerprint ?? undefined;
+                                lastComputedFullFp ?? oldManifest?.fullFingerprint ?? undefined;
 
                             const lessonManifest: LessonManifest = {
                                 lessonId: lesson.id,
