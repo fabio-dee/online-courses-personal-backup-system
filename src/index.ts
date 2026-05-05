@@ -16,6 +16,7 @@ import type { PerceptualFingerprint } from './fingerprint/perceptual/types.js';
 import {
     createRunStats,
     mergeRunIntoLog,
+    stampFpSchema,
     printRunReport,
     type LessonChange,
     type LessonEventType,
@@ -279,6 +280,13 @@ async function runRefingerprint(outputDir: string, logger: Logger): Promise<void
     let rebuilt = 0;
     let skipped = 0;
 
+    // Collect every group dir that contains a touched course so we can stamp
+    // fp_schema=2 on .group-log.json after the walk (P0-5 fix).
+    // A "group dir" is the parent of outputDir (i.e. outputDir itself when the
+    // user passes the group root, or path.dirname(outputDir) otherwise).
+    // We stamp the parent of each course dir that contained at least one lesson.
+    const touchedGroupDirs = new Set<string>();
+
     // Walk at most 2 levels deep (module/lesson or root/lesson)
     async function processDir(dir: string) {
         let items: fs.Dirent[];
@@ -322,6 +330,9 @@ async function runRefingerprint(outputDir: string, logger: Logger): Promise<void
                     await writeAtomicJson(manifestPath, updatedManifest);
                     await writeFingerprintSidecar(subDir, fp);
                     rebuilt += 1;
+                    // Track the group dir (parent of the course dir) so we can
+                    // stamp fp_schema=2 on .group-log.json after the walk.
+                    touchedGroupDirs.add(path.dirname(path.dirname(subDir)));
                     logger.info(`  ✅ Re-fingerprinted: ${manifest.title}`);
                 } catch (err) {
                     logger.warn(`  ⚠️ Failed to re-fingerprint ${subDir}: ${String(err)}`);
@@ -337,6 +348,18 @@ async function runRefingerprint(outputDir: string, logger: Logger): Promise<void
     for (const entry of entries) {
         if (entry.isDirectory() && !entry.name.startsWith('.')) {
             await processDir(path.join(outputDir, entry.name));
+        }
+    }
+
+    // Stamp fp_schema=2 on every touched group's .group-log.json (P0-5 fix).
+    // --refingerprint previously early-returned before mergeRunIntoLog, so the
+    // group log never got the fp_schema stamp that --update relies on.
+    for (const groupDir of touchedGroupDirs) {
+        try {
+            await stampFpSchema(groupDir);
+            logger.info(`  📝 Stamped fp_schema=2 on ${groupDir}/.group-log.json`);
+        } catch (err) {
+            logger.warn(`  ⚠️ Failed to stamp group log at ${groupDir}: ${String(err)}`);
         }
     }
 
