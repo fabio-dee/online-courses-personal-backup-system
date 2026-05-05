@@ -1,3 +1,6 @@
+import type { PerceptualFingerprint } from './perceptual/types.js';
+export type { PerceptualFingerprint } from './perceptual/types.js';
+
 export type FfprobeFingerprint = {
     durationMs: number;
     nbStreams: number;
@@ -21,6 +24,9 @@ export type FullFingerprint = {
     ffprobe: FfprobeFingerprint | null;
     chunks: ChunkHashes | null;
     bodyHash: string | null;
+    /** Phase 3 perceptual data. Present after escalation runs. Null means escalation
+     *  was attempted but produced no data; undefined means it was never run. */
+    perceptual?: PerceptualFingerprint | null;
 };
 
 export type SignalName =

@@ -866,19 +866,29 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                                                 shouldRedownload = true;
                                             } else if (verdict.state === 'MINOR_CHANGE') {
                                                 // Ambiguous: escalate to perceptual signals (Phase 3)
+                                                // Cache hit: if prior perceptual data exists and L1–L3 agree,
+                                                // reuse stored data and skip expensive ffmpeg/fpcalc.
+                                                const priorPerceptual: PerceptualFingerprint | null =
+                                                    priorFullFp.perceptual ?? null;
+                                                const hasCachedPerceptual =
+                                                    priorPerceptual !== null &&
+                                                    priorPerceptual !== undefined;
                                                 try {
                                                     const durationMs = currentFullFp.ffprobe?.durationMs ?? 0;
-                                                    const priorPerceptual: PerceptualFingerprint | null =
-                                                        (priorFullFp as unknown as { perceptual?: PerceptualFingerprint }).perceptual ?? null;
-                                                    const escalation = await escalatedScore(localVideoPath, priorPerceptual, durationMs);
+                                                    const escalation = await escalatedScore(
+                                                        localVideoPath,
+                                                        priorPerceptual,
+                                                        durationMs,
+                                                    );
+                                                    // Store the freshly computed perceptual data (P0-3 fix:
+                                                    // replaces empty stubs with real frames/audio).
+                                                    currentFullFp.perceptual = escalation.computed;
+                                                    lastComputedFullFp = currentFullFp;
                                                     if (escalation.perceptualScore >= 4) {
                                                         shouldRedownload = false;
-                                                        videoStateLabel = 'UNCHANGED(perceptual)';
-                                                        // Attach perceptual fingerprint to current fp for storage
-                                                        (currentFullFp as unknown as { perceptual?: PerceptualFingerprint }).perceptual = {
-                                                            frames: null,
-                                                            audio: null,
-                                                        };
+                                                        videoStateLabel = hasCachedPerceptual
+                                                            ? 'UNCHANGED(perceptual-cached)'
+                                                            : 'UNCHANGED(perceptual)';
                                                     } else {
                                                         shouldRedownload = false; // MINOR_CHANGE: don't re-download unless REPLACED
                                                         videoStateLabel = 'MINOR_CHANGE';
