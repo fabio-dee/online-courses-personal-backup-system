@@ -699,6 +699,118 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
         await writeAtomicJson(path.join(baseOutputDir, '.course.json'), courseManifest);
 
         // ---------------------------------------------------------------------------
+        // Fix 1 — Global lessonId index.
+        // Walk the entire outputDir tree ONCE, building a map of lessonId →
+        // absolute lesson directory. This lets us find existing lesson dirs that
+        // live under a different parent (e.g. a previous run wrote under a
+        // different groupName slug) — the vault-relocation bug.
+        //
+        // Hard-capped at 10 levels deep to avoid pathological recursion.
+        // When a lessonId appears at multiple paths, prefer the one with the most
+        // recent lastCheckedAt and log a duplicate warning.
+        // ---------------------------------------------------------------------------
+        /** Global map: lessonId → absolute path of the lesson directory. */
+        const globalLessonIdIndex = new Map<string, string>();
+
+        async function buildGlobalLessonIdIndex(dir: string, depth = 0): Promise<void> {
+            if (depth > 10) return;
+            let entries: fs.Dirent[];
+            try {
+                entries = await fs.readdir(dir, { withFileTypes: true });
+            } catch {
+                return;
+            }
+            await Promise.all(entries.map(async (entry) => {
+                if (!entry.isDirectory()) return;
+                const subDir = path.join(dir, entry.name);
+                const manifestPath = path.join(subDir, 'lesson.json');
+                if (fs.existsSync(manifestPath)) {
+                    try {
+                        const manifest = await fs.readJson(manifestPath) as {
+                            lessonId?: string;
+                            lastCheckedAt?: string;
+                        };
+                        if (manifest.lessonId) {
+                            const existing = globalLessonIdIndex.get(manifest.lessonId);
+                            if (existing) {
+                                // Duplicate lessonId in vault — prefer most recently checked.
+                                let existingCheckedAt = 0;
+                                try {
+                                    const em = await fs.readJson(
+                                        path.join(existing, 'lesson.json')
+                                    ) as { lastCheckedAt?: string };
+                                    existingCheckedAt = em.lastCheckedAt
+                                        ? new Date(em.lastCheckedAt).getTime()
+                                        : 0;
+                                } catch { /* keep 0 */ }
+                                const newCheckedAt = manifest.lastCheckedAt
+                                    ? new Date(manifest.lastCheckedAt).getTime()
+                                    : 0;
+                                if (newCheckedAt > existingCheckedAt) {
+                                    globalLessonIdIndex.set(manifest.lessonId, subDir);
+                                }
+                                process.stderr.write(
+                                    `⚠️  Duplicate vault copies for lessonId ${manifest.lessonId}:\n` +
+                                    `   ${existing}\n   ${subDir}\n` +
+                                    `   Keeping the more recently checked copy.\n`
+                                );
+                            } else {
+                                globalLessonIdIndex.set(manifest.lessonId, subDir);
+                            }
+                        }
+                    } catch {
+                        // Unreadable manifest — skip
+                    }
+                } else {
+                    // Not a lesson dir; recurse.
+                    await buildGlobalLessonIdIndex(subDir, depth + 1);
+                }
+            }));
+        }
+
+        // Scan root: one level above the user-supplied outputDir (or above the computed
+        // default course dir). This covers sibling group/course dirs created by previous
+        // runs that used a different groupName slug — the vault-relocation scenario.
+        // The 10-level depth cap in buildGlobalLessonIdIndex keeps this bounded.
+        const scanRoot = outputOverride
+            ? path.dirname(outputOverride)   // e.g. downloads/ when -o downloads/startupempire
+            : path.dirname(path.dirname(baseOutputDir)); // default: above groupName/courseName
+        logger.info('🔍 Scanning vault for existing lessons...');
+        await buildGlobalLessonIdIndex(scanRoot);
+        logger.info(`   Found ${globalLessonIdIndex.size} existing lessons in vault.`);
+
+        // ---------------------------------------------------------------------------
+        // Fix 3 — Layout-fork warning.
+        // Detect when the freshly computed scrape path diverges from where the
+        // global index says a lesson already lives, and warn BEFORE downloading.
+        // ---------------------------------------------------------------------------
+        {
+            // Sample up to 5 lessonIds from the scrape to find any that already
+            // exist in the vault but outside the current baseOutputDir tree.
+            const sampleLessons = modules.flatMap(m => m.lessons).slice(0, 5);
+            let forkExistingParent: string | null = null;
+            for (const sample of sampleLessons) {
+                const existing = globalLessonIdIndex.get(sample.id);
+                // A fork exists when the lesson is known globally but lives OUTSIDE
+                // the fresh course output dir (baseOutputDir already incorporates any
+                // user-supplied -o override; no groupName/courseName appended here).
+                if (existing && !existing.startsWith(baseOutputDir + path.sep) && existing !== baseOutputDir) {
+                    // Report the course-level ancestor of the existing lesson dir.
+                    forkExistingParent = path.dirname(path.dirname(existing)); // lesson→module→course
+                    break;
+                }
+            }
+            if (forkExistingParent) {
+                process.stderr.write(
+                    `\n⚠️  vault layout fork detected\n` +
+                    `   existing lessons at: ${forkExistingParent}\n` +
+                    `   new scrape would write to: ${baseOutputDir}\n` +
+                    `   reusing existing locations to avoid duplicate downloads.\n\n`
+                );
+            }
+        }
+
+        // ---------------------------------------------------------------------------
         // Pass 0: Build per-module lessonId→dirName maps (filesystem scan, no network).
         // This allows us to find existing lesson dirs even when Skool reorders lessons.
         // ---------------------------------------------------------------------------
@@ -729,6 +841,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
         // ---------------------------------------------------------------------------
         // Pass 1: Classify every lesson (new vs existing) purely from the filesystem.
         // Used for the sanity-check abort before any network downloads happen.
+        // Fix 1: global map is checked FIRST; per-module map is the fallback.
         // ---------------------------------------------------------------------------
         type LessonClassification = {
             lessonId: string;
@@ -754,10 +867,15 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
             for (const lesson of module.lessons) {
                 const lIndex = lesson.index ?? 1;
                 const constructedDirName = `${lIndex}-${sanitizeName(lesson.title)}`;
-                // Prefer the dir found by lessonId; fall back to constructed name.
-                const resolvedDirName = idMap.get(lesson.id) ?? constructedDirName;
-                const manifestPath = path.join(moduleDir, resolvedDirName, 'lesson.json');
-                const isNew = !fs.existsSync(manifestPath);
+                // Fix 1: global index first, then per-module map, then constructed name.
+                const globalHit = globalLessonIdIndex.get(lesson.id);
+                const resolvedDirName = globalHit
+                    ? path.basename(globalHit)
+                    : (idMap.get(lesson.id) ?? constructedDirName);
+                // isNew: false when global map has a hit (lesson exists somewhere in vault).
+                const isNew = globalHit
+                    ? false
+                    : !fs.existsSync(path.join(moduleDir, resolvedDirName, 'lesson.json'));
                 allClassifications.push({
                     lessonId: lesson.id,
                     title: lesson.title,
@@ -770,11 +888,15 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
 
         // ---------------------------------------------------------------------------
         // Sanity-check abort (update mode only, skipped with --force-update).
+        // Fix 2: totalPrior is the size of the global lessonId index (not the
+        // per-course-path count) so the abort fires on vault-relocation scenarios
+        // where the fresh course path is empty but the vault is full of lessons.
         // ---------------------------------------------------------------------------
         if (options.update && !options.forceUpdate) {
-            // Count lessons that had a prior manifest anywhere in baseOutputDir.
-            // "Prior" = existed before this run started, regardless of module.
-            const totalPrior = allClassifications.filter(c => !c.isNew).length;
+            // Fix 2: use global vault lesson count as the "prior" baseline.
+            const totalPrior = globalLessonIdIndex.size > 0
+                ? globalLessonIdIndex.size
+                : allClassifications.filter(c => !c.isNew).length;
             const videosNew = allClassifications.filter(c => c.isNew).length;
             const ratio = videosNew / Math.max(totalPrior, 1);
 
@@ -851,9 +973,15 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             onStatus(message);
                         };
                         const constructedDirName = `${lIndex}-${sanitizeName(lesson.title)}`;
-                        // Prefer existing dir found by lessonId; fall back to constructed name.
-                        const lessonDirName = idMap.get(lesson.id) ?? constructedDirName;
-                        const lessonDir = path.join(moduleDir, lessonDirName);
+                        // Fix 1: global index first → per-module map → constructed name.
+                        // When global map has a hit, use that ABSOLUTE path directly so
+                        // the lesson is downloaded to / fingerprinted at its existing
+                        // location rather than the freshly-computed path under baseOutputDir.
+                        const globalLessonDir = globalLessonIdIndex.get(lesson.id);
+                        const lessonDirName = globalLessonDir
+                            ? path.basename(globalLessonDir)
+                            : (idMap.get(lesson.id) ?? constructedDirName);
+                        const lessonDir = globalLessonDir ?? path.join(moduleDir, lessonDirName);
 
                         options.callbacks?.onLessonStart?.({
                             moduleIndex: mInfo.mIndex,
