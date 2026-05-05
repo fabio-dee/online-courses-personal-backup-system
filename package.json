@@ -10,7 +10,9 @@
   "scripts": {
     "skool": "tsx src/cli.ts",
     "login": "tsx src/cli.ts login",
-    "regenerate-index": "tsx src/cli.ts regenerate-index"
+    "regenerate-index": "tsx src/cli.ts regenerate-index",
+    "test": "vitest run",
+    "test:watch": "vitest"
   },
   "author": "balmasi",
   "license": "CC-BY-NC-4.0",
@@ -45,6 +47,7 @@
     "@types/node": "^25.0.10",
     "ts-node": "^10.9.2",
     "tsx": "^4.21.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.9"
   }
 }
