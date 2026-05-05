@@ -19,6 +19,7 @@ type CliArgs = {
     lessonId?: string | null;
     regenerateDir?: string;
     update?: boolean;
+    forceUpdate?: boolean;
     logGroupDir?: string;
     logSince?: string;
     logLast?: number;
@@ -82,6 +83,10 @@ function parseArgs(args: string[]): CliArgs {
         }
         if (arg === '--update' || arg === '--refresh') {
             parsed.update = true;
+            continue;
+        }
+        if (arg === '--force-update') {
+            parsed.forceUpdate = true;
             continue;
         }
         if (arg === '--lesson-id') {
@@ -618,7 +623,8 @@ async function runWithArgs(args: CliArgs) {
                         outputDir: outputRoot ? resolveCourseOutputDir(outputRoot, library.groupName, course.title) : undefined,
                         concurrency: args.concurrency,
                         mode: 'course',
-                        update: args.update
+                        update: args.update,
+                        forceUpdate: args.forceUpdate
                     });
                 } catch (err) {
                     failedCourses += 1;
@@ -638,7 +644,8 @@ async function runWithArgs(args: CliArgs) {
             concurrency: args.concurrency,
             mode: args.mode,
             lessonId: args.lessonId,
-            update: args.update
+            update: args.update,
+            forceUpdate: args.forceUpdate
         });
         return;
     }
