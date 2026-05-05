@@ -336,6 +336,29 @@ async function runRefingerprint(outputDir: string, logger: Logger, forceRefinger
                     const manifest = await fs.readJson(manifestPath) as LessonManifest;
                     if (!manifest.lessonId) continue;
 
+                    // Resolve the group root once per lesson so we stamp it
+                    // even if the lesson is later skipped (already current,
+                    // no video, etc.) — otherwise an all-skipped run leaves
+                    // the group log unstamped.
+                    let groupRoot = outputDir;
+                    let probeForGroup = path.dirname(subDir);
+                    while (probeForGroup.startsWith(outputDir) && probeForGroup !== outputDir) {
+                        const candidate = path.join(probeForGroup, '.group-log.json');
+                        if (fs.existsSync(candidate)) {
+                            try {
+                                const log = await fs.readJson(candidate) as { lessons?: Record<string, unknown> };
+                                if (log.lessons && Object.keys(log.lessons).length > 0) {
+                                    groupRoot = probeForGroup;
+                                    break;
+                                }
+                            } catch {
+                                // Corrupt log — keep walking
+                            }
+                        }
+                        probeForGroup = path.dirname(probeForGroup);
+                    }
+                    touchedGroupDirs.add(groupRoot);
+
                     const videoPath = path.join(subDir, 'video.mp4');
                     const hevcPath = path.join(subDir, 'video.hevc.mp4');
                     const existingVideoPath = [videoPath, hevcPath].find(
@@ -386,26 +409,7 @@ async function runRefingerprint(outputDir: string, logger: Logger, forceRefinger
                     await writeAtomicJson(manifestPath, updatedManifest);
                     await writeFingerprintSidecar(subDir, fp);
                     rebuilt += 1;
-                    // Walk up from the lesson dir until we find an EXISTING
-                    // .group-log.json with at least one lesson recorded. That
-                    // is the real group root. Avoids creating spurious empty
-                    // group-logs at every intermediate course/module dir.
-                    let probe = path.dirname(subDir);
-                    while (probe.startsWith(outputDir) && probe !== outputDir) {
-                        const candidate = path.join(probe, '.group-log.json');
-                        if (fs.existsSync(candidate)) {
-                            try {
-                                const log = await fs.readJson(candidate) as { lessons?: Record<string, unknown> };
-                                if (log.lessons && Object.keys(log.lessons).length > 0) {
-                                    touchedGroupDirs.add(probe);
-                                    break;
-                                }
-                            } catch {
-                                // Corrupt log — skip and keep walking up
-                            }
-                        }
-                        probe = path.dirname(probe);
-                    }
+                    // Group dir already added to touchedGroupDirs above.
                     logger.info(`  ✅ Re-fingerprinted: ${manifest.title}`);
                 } catch (err) {
                     logger.warn(`  ⚠️ Failed to re-fingerprint ${subDir}: ${String(err)}`);
