@@ -21,6 +21,7 @@ type CliArgs = {
     update?: boolean;
     forceUpdate?: boolean;
     refingerprint?: boolean;
+    forceRefingerprint?: boolean;
     logGroupDir?: string;
     logSince?: string;
     logLast?: number;
@@ -29,7 +30,7 @@ type CliArgs = {
 };
 
 function showHelp() {
-    console.log(`\nSkool Downloader\n\nUsage:\n  skool                          Interactive mode\n  skool login                    Log in to Skool\n  skool <classroom-url>          Download a course\n  skool <group-classroom-url>    Download all courses in a community\n  skool <lesson-url>             Download a single lesson (URL with ?md=)\n  skool regenerate-index         Regenerate all course indexes\n  skool log <group-dir>          Show what changed in recent runs\n    --since <Nd|Nh|Nm|ISO>       Only events newer than this\n    --last <N>                   Last N runs\n    --latest                     Latest run only (default)\n    --json                       Machine-readable output\n\nOptions:\n  -o, --output <dir>             Output directory (course root)\n  -c, --concurrency <number>     Lesson concurrency (default: 8)\n  --course                       Force course mode (ignore ?md=)\n  --lesson                       Force lesson mode\n  --lesson-id <id>               Explicit lesson id\n  --update                       Check existing lessons for updates and re-download only changed content\n  -h, --help                     Show help\n`);
+    console.log(`\nSkool Downloader\n\nUsage:\n  skool                          Interactive mode\n  skool login                    Log in to Skool\n  skool <classroom-url>          Download a course\n  skool <group-classroom-url>    Download all courses in a community\n  skool <lesson-url>             Download a single lesson (URL with ?md=)\n  skool regenerate-index         Regenerate all course indexes\n  skool log <group-dir>          Show what changed in recent runs\n    --since <Nd|Nh|Nm|ISO>       Only events newer than this\n    --last <N>                   Last N runs\n    --latest                     Latest run only (default)\n    --json                       Machine-readable output\n\nOptions:\n  -o, --output <dir>             Output directory (course root)\n  -c, --concurrency <number>     Lesson concurrency (default: 8)\n  --course                       Force course mode (ignore ?md=)\n  --lesson                       Force lesson mode\n  --lesson-id <id>               Explicit lesson id\n  --update                       Check existing lessons for updates and re-download only changed content\n  --refingerprint                Rebuild all fingerprints from disk (no network)\n  --force-refingerprint          Bypass fp_schema=2 optimization during --refingerprint\n  -h, --help                     Show help\n`);
 }
 
 function parseArgs(args: string[]): CliArgs {
@@ -94,13 +95,20 @@ function parseArgs(args: string[]): CliArgs {
             parsed.refingerprint = true;
             continue;
         }
+        if (arg === '--force-refingerprint') {
+            parsed.forceRefingerprint = true;
+            continue;
+        }
         if (arg === '--lesson-id') {
             parsed.lessonId = args[i + 1];
             i++;
             continue;
         }
         if (arg === '-o' || arg === '--output') {
-            parsed.outputDir = args[i + 1];
+            const next = args[i + 1];
+            if (next && !next.startsWith('-')) {
+                parsed.outputDir = next;
+            }
             i++;
             continue;
         }
@@ -652,6 +660,7 @@ async function runWithArgs(args: CliArgs) {
             update: args.update,
             forceUpdate: args.forceUpdate,
             refingerprint: args.refingerprint,
+            forceRefingerprint: args.forceRefingerprint,
         });
         return;
     }

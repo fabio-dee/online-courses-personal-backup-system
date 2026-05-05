@@ -171,6 +171,8 @@ export type DownloadOptions = {
      * No scraping, no downloading.
      */
     refingerprint?: boolean;
+    /** When true: bypass the fp_schema=2 early-skip optimization in --refingerprint. */
+    forceRefingerprint?: boolean;
 };
 
 export type DownloadSummary = {
@@ -297,8 +299,13 @@ async function loadOrRebuildFingerprint(
  * Run the --refingerprint pass: scan all existing lesson.json files under outputDir,
  * rebuild FullFingerprint from disk for each, write updated lesson.json + sidecar.
  * No scraping, no downloading.
+ *
+ * When forceRefingerprint is false (default), skips lessons that already have:
+ * 1. lesson.json with fullFingerprint.fp_schema === 2
+ * 2. lesson.fingerprint.json sidecar with fp_schema === 2
+ * 3. Video mtime older than sidecar mtime (video hasn't been re-encoded)
  */
-async function runRefingerprint(outputDir: string, logger: Logger): Promise<void> {
+async function runRefingerprint(outputDir: string, logger: Logger, forceRefingerprint = false): Promise<void> {
     logger.info('🔬 --refingerprint: scanning vault for lessons to re-fingerprint...');
     const entries = await fs.readdir(outputDir, { withFileTypes: true });
     let rebuilt = 0;
@@ -337,6 +344,31 @@ async function runRefingerprint(outputDir: string, logger: Logger): Promise<void
                     if (!existingVideoPath) {
                         skipped += 1;
                         continue;
+                    }
+
+                    // P2-1: Early skip if lesson is already at fp_schema=2 and video hasn't changed
+                    if (!forceRefingerprint) {
+                        const sidecarPath = path.join(subDir, 'lesson.fingerprint.json');
+                        const hasSidecar = fs.existsSync(sidecarPath);
+                        const hasManifestFp = manifest.fullFingerprint?.fp_schema === 2;
+                        if (hasSidecar && hasManifestFp) {
+                            try {
+                                const sidecar = await fs.readJson(sidecarPath) as { fp_schema?: number };
+                                if (sidecar.fp_schema === 2) {
+                                    const videoMtime = fs.statSync(existingVideoPath).mtimeMs;
+                                    const sidecarMtime = fs.statSync(sidecarPath).mtimeMs;
+                                    if (videoMtime < sidecarMtime) {
+                                        // Video is older than sidecar → no re-encoding since last fingerprint
+                                        const relPath = path.relative(outputDir, subDir);
+                                        logger.info(`⏭️  Skipped (already at fp_schema=2): ${relPath}`);
+                                        skipped += 1;
+                                        continue;
+                                    }
+                                }
+                            } catch {
+                                // Fall through to recompute if sidecar is corrupted
+                            }
+                        }
                     }
 
                     // Read saved HTML from disk so bodyHash is computed from actual content.
@@ -463,10 +495,10 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
 
     // --refingerprint: rebuild all fingerprints from disk, no network needed.
     if (options.refingerprint) {
-        const outputDir = options.outputDir && options.outputDir !== 'undefined'
+        const outputDir = options.outputDir
             ? options.outputDir
             : path.join(process.cwd(), 'downloads');
-        await runRefingerprint(outputDir, logger);
+        await runRefingerprint(outputDir, logger, options.forceRefingerprint);
         // Return a minimal summary — caller doesn't use it in this mode.
         return {
             courseName: '',
@@ -549,10 +581,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
             sanitizedCourseName
         );
 
-        const outputOverride =
-            options.outputDir && options.outputDir !== 'undefined'
-                ? options.outputDir
-                : undefined;
+        const outputOverride = options.outputDir || undefined;
         const baseOutputDir = outputOverride || defaultOutputDir;
         if (!baseOutputDir) {
             throw new Error('Output directory resolution failed.');
