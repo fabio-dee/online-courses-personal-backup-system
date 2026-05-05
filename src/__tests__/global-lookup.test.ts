@@ -328,6 +328,75 @@ describe('Fix 1 — global lessonId index prevents duplicate download on vault r
 });
 
 // ---------------------------------------------------------------------------
+// Regression test for the production classroom-iteration bug:
+// CLI passes outputDir=<vault>/<groupName>/<courseName> and vaultRoot=<vault>.
+// Without the vaultRoot plumbing, the global walk only scans <vault>/<groupName>,
+// which is the empty fresh tree — the legacy flat layout at <vault>/<courseName>
+// is invisible. Real-world bug that re-downloaded 161 videos (40 GB).
+// ---------------------------------------------------------------------------
+
+describe('regression — classroom iteration with vaultRoot finds legacy flat layout', () => {
+    let tmpVaultRoot: string;
+    let legacyLessonDir: string;
+
+    beforeEach(async () => {
+        tmpVaultRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'skool-classroom-bug-'));
+        // Legacy flat layout: <vault>/CourseA/Module/Lesson — NO group dir
+        const moduleDir = path.join(tmpVaultRoot, 'CourseA', 'Module');
+        await fs.ensureDir(moduleDir);
+        legacyLessonDir = path.join(moduleDir, '1-Lesson-0');
+        await fs.ensureDir(legacyLessonDir);
+
+        const contentHtml = '<p>hello 0</p>';
+        const contentHash = makeContentHash({ title: 'Lesson 0', contentHtml });
+        await fs.writeJson(path.join(legacyLessonDir, 'lesson.json'), {
+            lessonId: 'L1',
+            title: 'Lesson 0',
+            moduleIndex: 1, moduleTitle: 'Module', lessonIndex: 1,
+            moduleDirName: 'Module', lessonDirName: '1-Lesson-0',
+            relativePath: 'Module/1-Lesson-0/index.html',
+            hasVideo: true, resourcesCount: 0,
+            updatedAt: new Date().toISOString(),
+            contentHash,
+            videoFingerprint: { source: 'mux', playbackId: 'playback-L1' },
+            firstDownloadedAt: new Date(Date.now() - 86_400_000).toISOString(),
+            lastCheckedAt: new Date(Date.now() - 86_400_000).toISOString(),
+        });
+        await fs.writeFile(path.join(legacyLessonDir, 'video.mp4'), Buffer.alloc(1024));
+        await fs.writeFile(path.join(legacyLessonDir, 'index.html'), contentHtml);
+    });
+
+    afterEach(async () => {
+        await fs.remove(tmpVaultRoot).catch(() => undefined);
+    });
+
+    it('vaultRoot finds legacy lesson; no fork tree created at <vault>/<groupName>/<courseName>', async () => {
+        // Simulate the CLI's per-course dispatch:
+        //   outputDir = <vault>/NewGroup/CourseA  (resolveCourseOutputDir output)
+        //   vaultRoot = <vault>                   (the user's -o arg)
+        const courseOutputDir = path.join(tmpVaultRoot, 'NewGroup', 'CourseA');
+
+        await downloadCourse({
+            url: 'https://www.skool.com/newgroup/classroom',
+            outputDir: courseOutputDir,
+            vaultRoot: tmpVaultRoot,
+            update: true,
+            suppressIndexLogs: true,
+        });
+
+        // The legacy lesson must still be there.
+        expect(fs.existsSync(path.join(legacyLessonDir, 'lesson.json'))).toBe(true);
+
+        // Critically: the freshly-resolved path under NewGroup/CourseA/Module
+        // must NOT have a 1-Lesson-0 dir — the global lookup should have
+        // diverted writes to the legacy path.
+        const freshLessonDir = path.join(courseOutputDir, 'Module', '1-Lesson-0');
+        expect(fs.existsSync(freshLessonDir)).toBe(false);
+    });
+
+});
+
+// ---------------------------------------------------------------------------
 // Test suite: Fix 2 — global sanity abort fires on vault-relocation scenario
 // ---------------------------------------------------------------------------
 

@@ -173,6 +173,13 @@ export type DownloadOptions = {
     refingerprint?: boolean;
     /** When true: bypass the fp_schema=2 early-skip optimization in --refingerprint. */
     forceRefingerprint?: boolean;
+    /**
+     * Optional explicit vault root for the global lessonId index walk. When the
+     * caller is iterating multiple courses in a classroom and outputDir already
+     * contains a groupName/courseName suffix, set vaultRoot to the user's `-o`
+     * value so the scan root reaches the actual vault top-level.
+     */
+    vaultRoot?: string;
 };
 
 export type DownloadSummary = {
@@ -768,13 +775,16 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
             }));
         }
 
-        // Scan root: one level above the user-supplied outputDir (or above the computed
-        // default course dir). This covers sibling group/course dirs created by previous
-        // runs that used a different groupName slug — the vault-relocation scenario.
-        // The 10-level depth cap in buildGlobalLessonIdIndex keeps this bounded.
-        const scanRoot = outputOverride
-            ? path.dirname(outputOverride)   // e.g. downloads/ when -o downloads/startupempire
-            : path.dirname(path.dirname(baseOutputDir)); // default: above groupName/courseName
+        // Scan root: prefer the explicit vaultRoot when the CLI passes it (classroom
+        // iteration sets outputDir to <vaultRoot>/<groupName>/<courseName>, so dirname
+        // of outputDir would only see the groupName tree and miss legacy flat layouts).
+        // Fall back to the user-supplied outputOverride's dirname, then to the computed
+        // default. The 10-level depth cap in buildGlobalLessonIdIndex keeps this bounded.
+        const scanRoot = options.vaultRoot
+            ? options.vaultRoot
+            : outputOverride
+            ? path.dirname(outputOverride)
+            : path.dirname(path.dirname(baseOutputDir));
         logger.info('🔍 Scanning vault for existing lessons...');
         await buildGlobalLessonIdIndex(scanRoot);
         logger.info(`   Found ${globalLessonIdIndex.size} existing lessons in vault.`);

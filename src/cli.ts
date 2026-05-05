@@ -427,6 +427,7 @@ async function runInteractive() {
                 const summary = await downloadCourse({
                     url: course.url,
                     outputDir: outputRoot ? resolveCourseOutputDir(outputRoot, library.groupName, course.title) : undefined,
+                    vaultRoot: outputRoot,
                     concurrency,
                     mode: 'course',
                     logger: interactiveLogger,
@@ -649,6 +650,7 @@ async function runWithArgs(args: CliArgs) {
                     await downloadCourse({
                         url: course.url,
                         outputDir: outputRoot ? resolveCourseOutputDir(outputRoot, library.groupName, course.title) : undefined,
+                        vaultRoot: outputRoot,
                         concurrency: args.concurrency,
                         mode: 'course',
                         update: args.update,
