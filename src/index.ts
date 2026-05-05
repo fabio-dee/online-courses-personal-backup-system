@@ -275,18 +275,18 @@ async function loadOrRebuildFingerprint(
         return { fp: null, wasStale: true };
     }
 
-    // Read the saved HTML from disk so bodyHash is computed from actual content,
-    // not from manifest.contentHash which is already a sha256 hex string (wrong input).
-    // If index.html is absent, pass null and bodyHash will be null in the fp.
-    const indexHtmlPath = path.join(lessonDir, 'index.html');
-    const bodyHtml: string | null = fs.existsSync(indexHtmlPath)
-        ? await fs.readFile(indexHtmlPath, 'utf8').catch(() => null)
-        : null;
-
+    // bodyHash MUST be null in offline rebuild paths.
+    // index.html on disk is the rendered offline-viewer template (custom HTML
+    // wrapping with nav, theming, asset rewrites) — NOT the raw lesson body
+    // that the live --update path hashes from lessonData.contentHtml. Hashing
+    // the template would create permanent mismatches → false text-updated on
+    // every run. scoreBody treats null on either side as UNCHANGED (Wave A
+    // P0-1 fix). Legacy contentHash on lesson.json still catches real body
+    // changes via the live --update path which sets bodyHash correctly.
     try {
         const fp = await computeFullFingerprint(
             existingVideoPath,
-            bodyHtml,
+            null,
             manifest.videoFingerprint?.playbackId,
         );
         return { fp, wasStale: true };
@@ -394,15 +394,12 @@ async function runRefingerprint(outputDir: string, logger: Logger, forceRefinger
                         }
                     }
 
-                    // Read saved HTML from disk so bodyHash is computed from actual content.
-                    // If index.html is absent, pass null — bodyHash will be null in the fp.
-                    const indexHtmlPath = path.join(subDir, 'index.html');
-                    const bodyHtml: string | null = fs.existsSync(indexHtmlPath)
-                        ? await fs.readFile(indexHtmlPath, 'utf8').catch(() => null)
-                        : null;
+                    // bodyHash MUST be null here — index.html on disk is the
+                    // rendered offline-viewer template, not the raw lesson body
+                    // that --update hashes. See loadOrRebuildFingerprint above.
                     const fp = await computeFullFingerprint(
                         existingVideoPath,
-                        bodyHtml,
+                        null,
                         manifest.videoFingerprint?.playbackId,
                     );
                     const updatedManifest: LessonManifest = { ...manifest, fullFingerprint: fp };
