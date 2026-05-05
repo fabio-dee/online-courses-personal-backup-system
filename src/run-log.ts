@@ -50,6 +50,8 @@ export type LessonLogEntry = {
 
 export type GroupLog = {
     schemaVersion: 1;
+    /** Fingerprint schema version. Present when fp_schema=2 data has been written. */
+    fp_schema?: 2;
     groupName: string;
     lessons: Record<string, LessonLogEntry>;
     events: LessonEvent[];
@@ -168,11 +170,14 @@ export async function mergeRunIntoLog(groupDir: string, stats: RunStats): Promis
     const existing = await readGroupLog(groupDir);
     const log: GroupLog = existing ?? {
         schemaVersion: 1,
+        fp_schema: 2,
         groupName: stats.groupName,
         lessons: {},
         events: [],
         runs: []
     };
+    // Always stamp fp_schema=2 so readers know full fingerprints may be present.
+    log.fp_schema = 2;
 
     if (!log.groupName) {
         log.groupName = stats.groupName;
