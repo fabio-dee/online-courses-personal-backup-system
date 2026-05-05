@@ -607,7 +607,9 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
         );
 
         const outputOverride = options.outputDir || undefined;
-        const baseOutputDir = outputOverride || defaultOutputDir;
+        // baseOutputDir is `let` so the layout-fork redirect (Phase 6) can rebind
+        // it to the existing-lesson parent BEFORE any course-level writes happen.
+        let baseOutputDir = outputOverride || defaultOutputDir;
         if (!baseOutputDir) {
             throw new Error('Output directory resolution failed.');
         }
@@ -703,7 +705,9 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
             updatedAt: new Date().toISOString()
         };
 
-        await writeAtomicJson(path.join(baseOutputDir, '.course.json'), courseManifest);
+        // .course.json write is deferred until AFTER the layout-fork detection
+        // below, so that on a fork it lands in the EXISTING course dir, not the
+        // freshly-computed one (which would orphan a duplicate manifest).
 
         // ---------------------------------------------------------------------------
         // Fix 1 — Global lessonId index.
@@ -817,8 +821,39 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                     `   new scrape would write to: ${baseOutputDir}\n` +
                     `   reusing existing locations to avoid duplicate downloads.\n\n`
                 );
+
+                // Redirect bookkeeping writes (.course.json, regenerateIndex,
+                // regenerateGroupIndex, mergeRunIntoLog) to the existing layout.
+                // Otherwise the freshly-computed groupName/courseName tree gets
+                // populated with course-level metadata + a parallel .group-log.json
+                // even though the lesson content correctly stays in the legacy paths.
+                const previousBase = baseOutputDir;
+                baseOutputDir = forkExistingParent;
+                activeOutputDir = baseOutputDir;
+                activeGroupDir = path.dirname(baseOutputDir);
+
+                // Best-effort cleanup: remove the freshly-created (now-empty)
+                // fresh course dir to avoid leaving an empty fork tree on disk.
+                // Only delete if it has no lesson.json descendants.
+                try {
+                    const hasLessons = (await fs.readdir(previousBase, { withFileTypes: true }))
+                        .some(e => e.isDirectory());
+                    if (!hasLessons) {
+                        await fs.remove(previousBase);
+                        // Also try to remove the now-empty group dir parent.
+                        const previousGroup = path.dirname(previousBase);
+                        const groupEntries = await fs.readdir(previousGroup).catch(() => [] as string[]);
+                        if (groupEntries.length === 0) await fs.remove(previousGroup);
+                    }
+                } catch {
+                    // Cleanup failure is non-fatal.
+                }
             }
         }
+
+        // .course.json must be written AFTER the layout-fork redirect above,
+        // so it lands at the canonical existing course dir, not at the fork tree.
+        await writeAtomicJson(path.join(baseOutputDir, '.course.json'), courseManifest);
 
         // ---------------------------------------------------------------------------
         // Pass 0: Build per-module lessonId→dirName maps (filesystem scan, no network).

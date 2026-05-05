@@ -394,6 +394,30 @@ describe('regression — classroom iteration with vaultRoot finds legacy flat la
         expect(fs.existsSync(freshLessonDir)).toBe(false);
     });
 
+    it('no fork bookkeeping leaks: .course.json + .group-log.json land at legacy paths', async () => {
+        // After the layout-fork redirect, NEITHER the freshly-computed course
+        // dir NOR its parent group dir should be left behind on disk. The
+        // canonical .course.json must exist at the existing course dir.
+        const courseOutputDir = path.join(tmpVaultRoot, 'NewGroup', 'CourseA');
+
+        await downloadCourse({
+            url: 'https://www.skool.com/newgroup/classroom',
+            outputDir: courseOutputDir,
+            vaultRoot: tmpVaultRoot,
+            update: true,
+            suppressIndexLogs: true,
+        });
+
+        // Canonical course manifest at the legacy course dir.
+        const legacyCourseDir = path.join(tmpVaultRoot, 'CourseA');
+        expect(fs.existsSync(path.join(legacyCourseDir, '.course.json'))).toBe(true);
+
+        // The group-log should be at the legacy group root (vaultRoot itself
+        // here, since the legacy layout has no group dir level).
+        // No fork tree at <vault>/NewGroup/.
+        expect(fs.existsSync(path.join(tmpVaultRoot, 'NewGroup'))).toBe(false);
+    });
+
 });
 
 // ---------------------------------------------------------------------------
