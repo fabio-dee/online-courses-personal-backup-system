@@ -138,6 +138,8 @@ export type DownloadOptions = {
     suppressIndexLogs?: boolean;
     runTasks?: (tasks: LessonTask[], concurrency: number) => Promise<void>;
     update?: boolean;
+    /** Skip the sanity-check abort even when >30% of prior lessons are flagged new. */
+    forceUpdate?: boolean;
 };
 
 export type DownloadSummary = {
@@ -403,6 +405,132 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
 
         await writeAtomicJson(path.join(baseOutputDir, '.course.json'), courseManifest);
 
+        // ---------------------------------------------------------------------------
+        // Pass 0: Build per-module lessonId→dirName maps (filesystem scan, no network).
+        // This allows us to find existing lesson dirs even when Skool reorders lessons.
+        // ---------------------------------------------------------------------------
+        /** Returns a map of lessonId → existing subdirectory name within moduleDir. */
+        async function buildLessonIdMap(moduleDir: string): Promise<Map<string, string>> {
+            const map = new Map<string, string>();
+            let entries: string[];
+            try {
+                entries = await fs.readdir(moduleDir);
+            } catch {
+                return map;
+            }
+            await Promise.all(entries.map(async (entry) => {
+                const manifestPath = path.join(moduleDir, entry, 'lesson.json');
+                try {
+                    if (!fs.existsSync(manifestPath)) return;
+                    const manifest = await fs.readJson(manifestPath) as { lessonId?: string };
+                    if (manifest.lessonId) {
+                        map.set(manifest.lessonId, entry);
+                    }
+                } catch {
+                    // Ignore unreadable manifests
+                }
+            }));
+            return map;
+        }
+
+        // ---------------------------------------------------------------------------
+        // Pass 1: Classify every lesson (new vs existing) purely from the filesystem.
+        // Used for the sanity-check abort before any network downloads happen.
+        // ---------------------------------------------------------------------------
+        type LessonClassification = {
+            lessonId: string;
+            title: string;
+            moduleTitle: string;
+            resolvedDirName: string;
+            isNew: boolean; // true when no prior lesson.json found
+        };
+
+        const allClassifications: LessonClassification[] = [];
+
+        // Per-module lessonId→dirName caches (reused in pass 2 task closures).
+        const moduleLessonIdMaps = new Map<number, Map<string, string>>();
+
+        for (let i = 0; i < modules.length; i++) {
+            const module = modules[i];
+            const mInfo = courseInfo[i];
+            const moduleDir = mInfo.moduleDirName ? path.join(baseOutputDir, mInfo.moduleDirName) : baseOutputDir;
+
+            const idMap = await buildLessonIdMap(moduleDir);
+            moduleLessonIdMaps.set(i, idMap);
+
+            for (const lesson of module.lessons) {
+                const lIndex = lesson.index ?? 1;
+                const constructedDirName = `${lIndex}-${sanitizeName(lesson.title)}`;
+                // Prefer the dir found by lessonId; fall back to constructed name.
+                const resolvedDirName = idMap.get(lesson.id) ?? constructedDirName;
+                const manifestPath = path.join(moduleDir, resolvedDirName, 'lesson.json');
+                const isNew = !fs.existsSync(manifestPath);
+                allClassifications.push({
+                    lessonId: lesson.id,
+                    title: lesson.title,
+                    moduleTitle: mInfo.title,
+                    resolvedDirName,
+                    isNew
+                });
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        // Sanity-check abort (update mode only, skipped with --force-update).
+        // ---------------------------------------------------------------------------
+        if (options.update && !options.forceUpdate) {
+            // Count lessons that had a prior manifest anywhere in baseOutputDir.
+            // "Prior" = existed before this run started, regardless of module.
+            const totalPrior = allClassifications.filter(c => !c.isNew).length;
+            const videosNew = allClassifications.filter(c => c.isNew).length;
+            const ratio = videosNew / Math.max(totalPrior, 1);
+
+            if (totalPrior >= 20 && ratio > 0.30) {
+                const ts = new Date().toISOString().replace(/[:.]/g, '-');
+                const abortFile = path.join(baseOutputDir, `.update-aborted-${ts}.json`);
+
+                const flagged = allClassifications
+                    .filter(c => c.isNew)
+                    .map(c => ({ lessonId: c.lessonId, title: c.title, moduleTitle: c.moduleTitle, reason: 'no-prior-manifest' }));
+
+                const report = {
+                    abortedAt: new Date().toISOString(),
+                    courseName,
+                    baseOutputDir,
+                    totalPrior,
+                    videosNew,
+                    ratio: Math.round(ratio * 1000) / 1000,
+                    flagged
+                };
+
+                try {
+                    await writeAtomicJson(abortFile, report);
+                } catch {
+                    // Best-effort; don't mask the real error.
+                }
+
+                // Print table to stderr.
+                process.stderr.write(`\n⛔  Sanity-check abort — ${videosNew} of ${totalPrior + videosNew} lessons have no prior manifest (${Math.round(ratio * 100)}% > 30%).\n`);
+                process.stderr.write(`    This usually means lesson directories were renamed due to upstream reordering.\n`);
+                process.stderr.write(`    Re-run with --force-update to bypass, or check the report: ${abortFile}\n\n`);
+                process.stderr.write(`    Flagged lessons (first 20):\n`);
+                process.stderr.write(`    ${'lessonId'.padEnd(36)} ${'module'.padEnd(30)} title\n`);
+                process.stderr.write(`    ${'-'.repeat(36)} ${'-'.repeat(30)} ${'-'.repeat(40)}\n`);
+                for (const f of flagged.slice(0, 20)) {
+                    process.stderr.write(`    ${f.lessonId.padEnd(36)} ${f.moduleTitle.slice(0, 30).padEnd(30)} ${f.title.slice(0, 60)}\n`);
+                }
+                if (flagged.length > 20) {
+                    process.stderr.write(`    ... and ${flagged.length - 20} more (see ${abortFile})\n`);
+                }
+                process.stderr.write('\n');
+
+                process.exit(2);
+            }
+        }
+
+        // ---------------------------------------------------------------------------
+        // Pass 2: Build download task list, reusing the lessonId maps from pass 0.
+        // ---------------------------------------------------------------------------
         const tasks: LessonTask[] = [];
 
         for (let i = 0; i < modules.length; i++) {
@@ -412,6 +540,8 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
             if (mInfo.moduleDirName) {
                 await fs.ensureDir(moduleDir);
             }
+
+            const idMap = moduleLessonIdMaps.get(i) ?? new Map<string, string>();
 
             for (const lesson of module.lessons) {
                 const lIndex = lesson.index ?? 1;
@@ -423,7 +553,9 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                             if (!onStatus || !message) return;
                             onStatus(message);
                         };
-                        const lessonDirName = `${lIndex}-${sanitizeName(lesson.title)}`;
+                        const constructedDirName = `${lIndex}-${sanitizeName(lesson.title)}`;
+                        // Prefer existing dir found by lessonId; fall back to constructed name.
+                        const lessonDirName = idMap.get(lesson.id) ?? constructedDirName;
                         const lessonDir = path.join(moduleDir, lessonDirName);
 
                         options.callbacks?.onLessonStart?.({
