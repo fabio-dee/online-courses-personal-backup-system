@@ -93,6 +93,7 @@ function parseArgs(args: string[]): CliArgs {
         }
         if (arg === '--refingerprint') {
             parsed.refingerprint = true;
+            parsed.command = 'download';
             continue;
         }
         if (arg === '--force-refingerprint') {
@@ -604,6 +605,20 @@ async function runWithArgs(args: CliArgs) {
             latest: args.logLatest,
             json: args.logJson
         }, plainLogger);
+        return;
+    }
+
+    if (args.command === 'download' && args.refingerprint) {
+        await downloadCourse({
+            url: 'https://placeholder',
+            outputDir: args.outputDir,
+            concurrency: args.concurrency,
+            mode: args.mode,
+            update: args.update,
+            forceUpdate: args.forceUpdate,
+            refingerprint: true,
+            forceRefingerprint: args.forceRefingerprint,
+        });
         return;
     }
 
