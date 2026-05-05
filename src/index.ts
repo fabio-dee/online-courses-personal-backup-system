@@ -676,20 +676,10 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
             lessonDestination
         });
 
+        // Course cover image and .course.json writes are deferred until AFTER
+        // the layout-fork detection so they land at the canonical (possibly
+        // redirected) baseOutputDir, not the fresh fork tree.
         let courseImagePath: string | undefined;
-        if (courseImageUrl) {
-            try {
-                const assetsDir = path.join(baseOutputDir, 'assets');
-                await fs.ensureDir(assetsDir);
-                const ext = getUrlExtension(courseImageUrl);
-                const localName = `course-cover${ext}`;
-                const localPath = path.join(assetsDir, localName);
-                await downloader.downloadAsset(courseImageUrl, localPath);
-                courseImagePath = `assets/${localName}`;
-            } catch (err) {
-                logger.warn('⚠️ Failed to download course image, continuing without it.');
-            }
-        }
 
         const courseManifest: CourseManifest = {
             courseName,
@@ -851,8 +841,23 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
             }
         }
 
-        // .course.json must be written AFTER the layout-fork redirect above,
-        // so it lands at the canonical existing course dir, not at the fork tree.
+        // Cover image and .course.json must be written AFTER the layout-fork
+        // redirect above, so they land at the canonical existing course dir.
+        if (courseImageUrl) {
+            try {
+                const assetsDir = path.join(baseOutputDir, 'assets');
+                await fs.ensureDir(assetsDir);
+                const ext = getUrlExtension(courseImageUrl);
+                const localName = `course-cover${ext}`;
+                const localPath = path.join(assetsDir, localName);
+                await downloader.downloadAsset(courseImageUrl, localPath);
+                courseImagePath = `assets/${localName}`;
+                courseManifest.courseImagePath = courseImagePath;
+            } catch {
+                logger.warn('⚠️ Failed to download course image, continuing without it.');
+            }
+        }
+
         await writeAtomicJson(path.join(baseOutputDir, '.course.json'), courseManifest);
 
         // ---------------------------------------------------------------------------
