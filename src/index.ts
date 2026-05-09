@@ -180,7 +180,65 @@ export type DownloadOptions = {
      * value so the scan root reaches the actual vault top-level.
      */
     vaultRoot?: string;
+    /**
+     * When true, allow the layout-fork redirect (Skool's API returned a
+     * groupName/courseName that differs from the existing on-disk layout) to
+     * proceed. The redirect rebinds writes to the existing layout AND, after a
+     * successful run, removes the freshly-computed (now-orphan) fork dirs.
+     *
+     * Default false: refuse the run with a LayoutForkRefusedError so the user
+     * can reconcile the two layouts manually (the historical default silently
+     * forked, which produced 26 GB of duplicated content on a real run).
+     */
+    allowLayoutFork?: boolean;
 };
+
+/**
+ * Thrown when the downloader detects that Skool's API would write to a
+ * different on-disk layout than where existing lessons already live, AND
+ * `allowLayoutFork` is not set. The user must either pass --allow-layout-fork
+ * (after backing up) or manually reconcile the two paths before re-running.
+ */
+export class LayoutForkRefusedError extends Error {
+    constructor(public readonly existingPath: string, public readonly freshPath: string) {
+        super(
+            `Vault layout fork detected and --allow-layout-fork was not set.\n` +
+            `   existing lessons at: ${existingPath}\n` +
+            `   new scrape would write to: ${freshPath}\n` +
+            `\n` +
+            `Refusing to proceed: writing to the new path while content exists at\n` +
+            `the old path would silently duplicate the entire course on disk and\n` +
+            `poison downstream tooling (transcripts, vault builder, MOCs).\n` +
+            `\n` +
+            `To resolve, choose ONE of:\n` +
+            `  1. Manually move/merge "${freshPath}" into "${existingPath}" and re-run.\n` +
+            `  2. Delete "${freshPath}" if it was created empty by an earlier aborted run.\n` +
+            `  3. Re-run with --allow-layout-fork to redirect writes to the existing\n` +
+            `     path and remove the orphan fork dirs after the run succeeds.\n`
+        );
+        this.name = 'LayoutForkRefusedError';
+    }
+}
+
+/**
+ * Thrown when the post-run orphan cleanup fails after a layout-fork redirect.
+ * Promoted from the previous best-effort/non-fatal behavior so users learn
+ * about leftover duplicate trees instead of silently accumulating them.
+ */
+export class LayoutForkCleanupError extends Error {
+    constructor(public readonly orphanPath: string, public readonly cause: unknown) {
+        super(
+            `Layout-fork orphan cleanup failed.\n` +
+            `   could not remove: ${orphanPath}\n` +
+            `   cause: ${String(cause)}\n` +
+            `\n` +
+            `The download itself completed successfully and content is at the\n` +
+            `canonical existing layout. Remove the orphan path manually:\n` +
+            `   rm -rf "${orphanPath}"\n`
+        );
+        this.name = 'LayoutForkCleanupError';
+    }
+}
 
 export type DownloadSummary = {
     courseName: string;
@@ -788,6 +846,12 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
         // Detect when the freshly computed scrape path diverges from where the
         // global index says a lesson already lives, and warn BEFORE downloading.
         // ---------------------------------------------------------------------------
+        // Track orphan paths produced by a layout-fork redirect so the post-run
+        // cleanup (gated on full run success) can FATALLY remove them. Promoted
+        // from the previous in-block best-effort cleanup, which silently failed
+        // and left 26 GB of duplicated content on a real production run.
+        let layoutForkOrphanCourseDir: string | null = null;
+        let layoutForkOrphanGroupDir: string | null = null;
         {
             // Sample up to 5 lessonIds from the scrape to find any that already
             // exist in the vault but outside the current baseOutputDir tree.
@@ -805,11 +869,22 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                 }
             }
             if (forkExistingParent) {
+                // REFUSE-BY-DEFAULT (Phase 1 fix). Historically this branch
+                // silently redirected and best-effort cleaned up the orphan
+                // tree. The cleanup failed silently in production, leaving
+                // a 26 GB duplicate vault on disk that poisoned downstream
+                // tooling. Now: refuse unless the user explicitly opted in
+                // via --allow-layout-fork.
+                if (!options.allowLayoutFork) {
+                    throw new LayoutForkRefusedError(forkExistingParent, baseOutputDir);
+                }
+
                 process.stderr.write(
-                    `\n⚠️  vault layout fork detected\n` +
+                    `\n⚠️  vault layout fork detected (--allow-layout-fork active)\n` +
                     `   existing lessons at: ${forkExistingParent}\n` +
                     `   new scrape would write to: ${baseOutputDir}\n` +
-                    `   reusing existing locations to avoid duplicate downloads.\n\n`
+                    `   reusing existing locations; orphan path will be removed\n` +
+                    `   AFTER successful run completion (failure to remove is fatal).\n\n`
                 );
 
                 // Redirect bookkeeping writes (.course.json, regenerateIndex,
@@ -822,21 +897,19 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                 activeOutputDir = baseOutputDir;
                 activeGroupDir = path.dirname(baseOutputDir);
 
-                // Best-effort cleanup: remove the freshly-created (now-empty)
-                // fresh course dir to avoid leaving an empty fork tree on disk.
-                // Only delete if it has no lesson.json descendants.
-                try {
-                    const hasLessons = (await fs.readdir(previousBase, { withFileTypes: true }))
-                        .some(e => e.isDirectory());
-                    if (!hasLessons) {
-                        await fs.remove(previousBase);
-                        // Also try to remove the now-empty group dir parent.
-                        const previousGroup = path.dirname(previousBase);
-                        const groupEntries = await fs.readdir(previousGroup).catch(() => [] as string[]);
-                        if (groupEntries.length === 0) await fs.remove(previousGroup);
-                    }
-                } catch {
-                    // Cleanup failure is non-fatal.
+                // Defer cleanup to the post-run phase. We MUST NOT delete
+                // anything mid-run: if the scrape fails partway, the user
+                // needs both layouts intact to diagnose. Remember the orphan
+                // path; the cleanup phase below will verify run success,
+                // re-check the orphan is empty of lesson content, and
+                // remove it (fatal on failure).
+                layoutForkOrphanCourseDir = previousBase;
+                const previousGroup = path.dirname(previousBase);
+                // Only mark the group dir for cleanup if it differs from the
+                // existing layout's group dir (otherwise we'd nuke the parent
+                // of our redirected target).
+                if (previousGroup !== activeGroupDir && previousGroup !== path.dirname(activeGroupDir ?? '')) {
+                    layoutForkOrphanGroupDir = previousGroup;
                 }
             }
         }
@@ -1630,6 +1703,62 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
         options.callbacks?.onCourseComplete?.(summary);
 
         printRunReport(stats, logger);
+
+        // ---------------------------------------------------------------------------
+        // Phase 1 fix — Layout-fork orphan cleanup (FATAL on failure).
+        // Runs only when (a) a layout-fork redirect happened earlier in this run,
+        // (b) --allow-layout-fork was set (otherwise we'd have thrown), and
+        // (c) the run completed with zero failed lessons. If any lesson failed
+        // we leave both layouts intact so the user can diagnose with full data.
+        //
+        // Cleanup failure throws LayoutForkCleanupError — the caller MUST see
+        // it. Previously this was a silent try/catch that left 26 GB of duplicate
+        // content on disk and poisoned downstream tooling.
+        // ---------------------------------------------------------------------------
+        if (layoutForkOrphanCourseDir) {
+            if (failedLessons > 0) {
+                logger.warn(
+                    `⚠️ Layout-fork orphan cleanup SKIPPED: ${failedLessons} lesson(s) failed.\n` +
+                    `   Both layouts left intact for diagnosis:\n` +
+                    `     canonical: ${baseOutputDir}\n` +
+                    `     orphan:    ${layoutForkOrphanCourseDir}\n` +
+                    `   Re-run after resolving failures, or remove the orphan manually.`
+                );
+            } else {
+                // Sanity guard: never delete a path that is the active output
+                // dir, the active group dir, or any ancestor of them. Defense
+                // in depth in case the redirect logic ever miscomputes.
+                const activeAbs = path.resolve(baseOutputDir);
+                const orphanAbs = path.resolve(layoutForkOrphanCourseDir);
+                if (activeAbs === orphanAbs || activeAbs.startsWith(orphanAbs + path.sep)) {
+                    throw new LayoutForkCleanupError(
+                        layoutForkOrphanCourseDir,
+                        new Error(
+                            `Refusing to remove orphan path because the active output ` +
+                            `dir "${baseOutputDir}" is inside it. This indicates a bug ` +
+                            `in the layout-fork redirect logic.`
+                        )
+                    );
+                }
+                try {
+                    await fs.remove(layoutForkOrphanCourseDir);
+                    logger.info(`🧹 Removed layout-fork orphan: ${layoutForkOrphanCourseDir}`);
+                } catch (err) {
+                    throw new LayoutForkCleanupError(layoutForkOrphanCourseDir, err);
+                }
+                if (layoutForkOrphanGroupDir) {
+                    try {
+                        const remaining = await fs.readdir(layoutForkOrphanGroupDir).catch(() => null);
+                        if (remaining !== null && remaining.length === 0) {
+                            await fs.remove(layoutForkOrphanGroupDir);
+                            logger.info(`🧹 Removed empty layout-fork orphan group dir: ${layoutForkOrphanGroupDir}`);
+                        }
+                    } catch (err) {
+                        throw new LayoutForkCleanupError(layoutForkOrphanGroupDir, err);
+                    }
+                }
+            }
+        }
 
         return summary;
     } finally {

@@ -206,6 +206,7 @@ describe('Fix 1 — global lessonId index prevents duplicate download on vault r
             url: 'https://www.skool.com/newgroup/classroom',
             outputDir: newCourseDir,
             update: true,
+            allowLayoutFork: true,
             suppressIndexLogs: true,
         });
 
@@ -222,6 +223,7 @@ describe('Fix 1 — global lessonId index prevents duplicate download on vault r
             url: 'https://www.skool.com/newgroup/classroom',
             outputDir: newCourseDir,
             update: true,
+            allowLayoutFork: true,
             suppressIndexLogs: true,
         });
 
@@ -315,6 +317,7 @@ describe('Fix 1 — global lessonId index prevents duplicate download on vault r
                 url: 'https://www.skool.com/newgroup/classroom',
                 outputDir: newCourseDir,
                 update: true,
+                allowLayoutFork: true,
                 suppressIndexLogs: true,
             });
         } finally {
@@ -381,6 +384,7 @@ describe('regression — classroom iteration with vaultRoot finds legacy flat la
             outputDir: courseOutputDir,
             vaultRoot: tmpVaultRoot,
             update: true,
+            allowLayoutFork: true,
             suppressIndexLogs: true,
         });
 
@@ -405,6 +409,7 @@ describe('regression — classroom iteration with vaultRoot finds legacy flat la
             outputDir: courseOutputDir,
             vaultRoot: tmpVaultRoot,
             update: true,
+            allowLayoutFork: true,
             suppressIndexLogs: true,
         });
 
@@ -522,5 +527,128 @@ describe('Fix 2 — global sanity abort uses global lesson count', () => {
                 suppressIndexLogs: true,
             })
         ).resolves.toBeDefined();
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Phase 1 fix — Layout-fork refuse-by-default + fatal post-run cleanup
+// ---------------------------------------------------------------------------
+
+import { LayoutForkRefusedError, LayoutForkCleanupError } from '../index.js';
+
+describe('Phase 1 — layout-fork refuse-by-default + fatal cleanup', () => {
+    let tmpBase: string;
+
+    beforeEach(async () => {
+        tmpBase = await fs.mkdtemp(path.join(os.tmpdir(), 'skool-layout-fork-phase1-'));
+        await buildExistingVault(tmpBase, {
+            groupDirName: 'OldGroup',
+            lessonId: 'L1',
+        });
+    });
+
+    afterEach(async () => {
+        await fs.remove(tmpBase).catch(() => undefined);
+    });
+
+    it('refuses by default when layout fork is detected (LayoutForkRefusedError)', async () => {
+        const newCourseDir = path.join(tmpBase, 'NewGroup', 'CourseA');
+        await fs.ensureDir(newCourseDir);
+
+        await expect(
+            downloadCourse({
+                url: 'https://www.skool.com/newgroup/classroom',
+                outputDir: newCourseDir,
+                vaultRoot: tmpBase,
+                update: true,
+                suppressIndexLogs: true,
+                // allowLayoutFork omitted → must throw
+            })
+        ).rejects.toBeInstanceOf(LayoutForkRefusedError);
+
+        // The fresh fork course dir was created by ensureDir before detection,
+        // but no lesson content should have been written into it.
+        const freshLessonDir = path.join(newCourseDir, 'Module', '1-Lesson-0');
+        expect(fs.existsSync(freshLessonDir)).toBe(false);
+
+        // Existing lesson must remain intact.
+        const existingLesson = path.join(tmpBase, 'OldGroup', 'CourseA', 'Module', '1-Lesson-0', 'lesson.json');
+        expect(fs.existsSync(existingLesson)).toBe(true);
+    });
+
+    it('refused error includes both paths and remediation guidance', async () => {
+        const newCourseDir = path.join(tmpBase, 'NewGroup', 'CourseA');
+        await fs.ensureDir(newCourseDir);
+
+        let caught: unknown = null;
+        try {
+            await downloadCourse({
+                url: 'https://www.skool.com/newgroup/classroom',
+                outputDir: newCourseDir,
+                vaultRoot: tmpBase,
+                update: true,
+                suppressIndexLogs: true,
+            });
+        } catch (err) {
+            caught = err;
+        }
+        expect(caught).toBeInstanceOf(LayoutForkRefusedError);
+        const msg = (caught as Error).message;
+        expect(msg).toContain('layout fork detected');
+        expect(msg).toContain('--allow-layout-fork');
+        expect(msg).toContain(path.join(tmpBase, 'OldGroup', 'CourseA')); // existing
+        expect(msg).toContain(newCourseDir); // fresh
+    });
+
+    it('with --allow-layout-fork: orphan fork dirs removed AFTER successful run', async () => {
+        const newCourseDir = path.join(tmpBase, 'NewGroup', 'CourseA');
+        await fs.ensureDir(newCourseDir);
+
+        const summary = await downloadCourse({
+            url: 'https://www.skool.com/newgroup/classroom',
+            outputDir: newCourseDir,
+            vaultRoot: tmpBase,
+            update: true,
+            allowLayoutFork: true,
+            suppressIndexLogs: true,
+        });
+
+        expect(summary.failedLessons).toBe(0);
+        // Orphan course dir gone.
+        expect(fs.existsSync(newCourseDir)).toBe(false);
+        // Empty orphan group dir also cleaned up.
+        expect(fs.existsSync(path.join(tmpBase, 'NewGroup'))).toBe(false);
+        // Canonical layout intact.
+        expect(fs.existsSync(path.join(tmpBase, 'OldGroup', 'CourseA', '.course.json'))).toBe(true);
+    });
+
+    it('fatal cleanup throws LayoutForkCleanupError when orphan dir cannot be removed', async () => {
+        // Spy fs.remove and make it reject for the orphan path so we can prove
+        // the failure is now fatal (was silently swallowed prior to this fix).
+        const newCourseDir = path.join(tmpBase, 'NewGroup', 'CourseA');
+        await fs.ensureDir(newCourseDir);
+
+        const realRemove = fs.remove.bind(fs);
+        const removeSpy = vi.spyOn(fs, 'remove').mockImplementation(async (p: string) => {
+            if (path.resolve(p) === path.resolve(newCourseDir)) {
+                throw new Error('EACCES: simulated permission denied');
+            }
+            return realRemove(p);
+        });
+
+        try {
+            await expect(
+                downloadCourse({
+                    url: 'https://www.skool.com/newgroup/classroom',
+                    outputDir: newCourseDir,
+                    vaultRoot: tmpBase,
+                    update: true,
+                    allowLayoutFork: true,
+                    suppressIndexLogs: true,
+                })
+            ).rejects.toBeInstanceOf(LayoutForkCleanupError);
+        } finally {
+            removeSpy.mockRestore();
+        }
     });
 });
