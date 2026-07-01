@@ -1,4 +1,4 @@
-import { Scraper, Module } from './scraper.js';
+import { Scraper } from './scraper.js';
 import { Downloader } from './downloader.js';
 import { regenerateIndex } from './regenerate-index.js';
 import { regenerateGroupIndex } from './regenerate-group-index.js';
@@ -565,7 +565,7 @@ async function runConcurrent(tasks: Array<() => Promise<void>>, concurrency: num
         while (true) {
             const current = index;
             index += 1;
-            if (current >= tasks.length) return;
+            if (current >= tasks.length) return undefined;
             await tasks[current]();
         }
     });
@@ -780,7 +780,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
                 return;
             }
             await Promise.all(entries.map(async (entry) => {
-                if (!entry.isDirectory()) return;
+                if (!entry.isDirectory()) return undefined;
                 const subDir = path.join(dir, entry.name);
                 const manifestPath = path.join(subDir, 'lesson.json');
                 if (fs.existsSync(manifestPath)) {
@@ -949,7 +949,7 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
             await Promise.all(entries.map(async (entry) => {
                 const manifestPath = path.join(moduleDir, entry, 'lesson.json');
                 try {
-                    if (!fs.existsSync(manifestPath)) return;
+                    if (!fs.existsSync(manifestPath)) return undefined;
                     const manifest = await fs.readJson(manifestPath) as { lessonId?: string };
                     if (manifest.lessonId) {
                         map.set(manifest.lessonId, entry);
@@ -1231,8 +1231,18 @@ export async function downloadCourse(options: DownloadOptions): Promise<Download
 
                                         let shouldRedownload = false;
                                         let videoStateLabel = 'UNKNOWN';
+                                        const remoteFingerprintChanged =
+                                            newFp != null &&
+                                            oldManifest?.videoFingerprint != null &&
+                                            !videoFingerprintsEqual(newFp, oldManifest.videoFingerprint);
 
-                                        if (priorFullFp && currentFullFp) {
+                                        if (remoteFingerprintChanged) {
+                                            // The full scorer compares local file signals. The remote lightweight
+                                            // fingerprint is the authoritative first check for "the lesson now points
+                                            // at a different video" (Mux playbackId / yt-dlp id / duration).
+                                            shouldRedownload = true;
+                                            videoStateLabel = 'REPLACED(remote-fingerprint)';
+                                        } else if (priorFullFp && currentFullFp) {
                                             const verdict = scoreVideo(priorFullFp, currentFullFp);
                                             videoStateLabel = verdict.state;
 

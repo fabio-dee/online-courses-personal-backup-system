@@ -56,6 +56,15 @@ describe('scoreVideo', () => {
         expect(scoreVideo(prior, current).state).toBe('REPLACED');
     });
 
+    it('playback mismatch is not enough by itself to overpower local chunk matches', () => {
+        // The update pipeline must compare remote lightweight fingerprints before
+        // calling scoreVideo. scoreVideo mostly judges local-file similarity, so a
+        // remote playbackId mismatch can otherwise be masked by unchanged local chunks.
+        const prior = makeFingerprint({ playbackId: 'old-playback' });
+        const current = makeFingerprint({ playbackId: 'new-playback' });
+        expect(scoreVideo(prior, current).state).toBe('UNCHANGED');
+    });
+
     it('ffprobe null on prior → UNKNOWN', () => {
         const prior = makeFingerprint({ ffprobe: null });
         expect(scoreVideo(prior, makeFingerprint()).state).toBe('UNKNOWN');
