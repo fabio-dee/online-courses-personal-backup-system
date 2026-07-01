@@ -1803,6 +1803,9 @@ export async function downloadCourse(
 							const moduleBreadcrumb = isRootLesson
 								? ""
 								: `<span>/</span><span>${module.title}</span>`;
+							const videoFileName = fs.existsSync(path.join(lessonDir, "video.hevc.mp4"))
+								? "video.hevc.mp4"
+								: "video.mp4";
 
 							const htmlContent = `
                             <!DOCTYPE html>
@@ -1898,7 +1901,7 @@ export async function downloadCourse(
                                     </div>
                                     <div class="container">
                                         <h1>${lessonData.title}</h1>
-                                        ${hasVideo ? '<video controls src="video.mp4"></video>' : ""}
+                                        ${hasVideo ? `<video controls src="${videoFileName}"></video>` : ""}
                                         <div class="content">
                                             ${localizedHtml}
                                         </div>
