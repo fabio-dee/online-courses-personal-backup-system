@@ -1803,7 +1803,9 @@ export async function downloadCourse(
 							const moduleBreadcrumb = isRootLesson
 								? ""
 								: `<span>/</span><span>${module.title}</span>`;
-							const videoFileName = fs.existsSync(path.join(lessonDir, "video.hevc.mp4"))
+							const videoFileName = fs.existsSync(
+								path.join(lessonDir, "video.hevc.mp4"),
+							)
 								? "video.hevc.mp4"
 								: "video.mp4";
 
